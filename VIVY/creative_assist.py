@@ -54,6 +54,52 @@ def load_document_text(path: str, max_chars: int = 60_000) -> LoadedDocument:
     raise RuntimeError(f"不支持的文件类型：.{ext}（支持 txt/md/docx/pdf）")
 
 
+# WPS/Word 加载项或 COM 桥：选区辅助（短请求，适合边写边点）
+OFFICE_PASSAGE_MAX = 14_000
+OFFICE_CONTEXT_MAX = 5_000
+
+OFFICE_ACTION_HINTS = {
+    "polish": "请只针对【选中文本】做润色：保留原意与人称，输出一版可直接替换的正文（不要前言后语）。",
+    "continue": "请根据【选中文本】自然续写 2～6 句，风格一致，直接输出续写正文。",
+    "critique": "请点评【选中文本】：问题、优点各若干条，再给 2 条可执行修改建议（简练）。",
+    "improve": "请在保持情节/论点不变的前提下，加强画面感或逻辑衔接；给出「修改后完整选段」替换原文。",
+    "free": "",  # 仅使用 user_goal
+}
+
+
+def build_office_passage_prompt(
+    passage: str,
+    action: str = "polish",
+    user_goal: Optional[str] = None,
+    context_excerpt: Optional[str] = None,
+) -> str:
+    passage = (passage or "").strip()
+    if not passage:
+        raise ValueError("选区文本为空")
+    goal = (user_goal or "").strip()
+    ctx = (context_excerpt or "").strip()
+    act = (action or "polish").strip().lower()
+    hint = OFFICE_ACTION_HINTS.get(act) or OFFICE_ACTION_HINTS["polish"]
+    if act == "free" and goal:
+        hint = goal
+    elif act == "free" and not goal:
+        hint = OFFICE_ACTION_HINTS["polish"]
+
+    parts = [
+        "用户正在文字处理软件（WPS/Word）中编辑，下列【选中文本】来自当前选区。",
+        hint,
+    ]
+    if goal and act != "free":
+        parts.append(f"用户补充说明：{goal}")
+    if ctx:
+        parts.append(
+            "【附近上下文（仅供参考，勿大段复述）】\n"
+            + ctx[:OFFICE_CONTEXT_MAX]
+        )
+    parts.append("【选中文本】\n" + passage[:OFFICE_PASSAGE_MAX])
+    return "\n\n".join(parts)
+
+
 def build_creative_prompt(doc: LoadedDocument, user_goal: Optional[str] = None) -> str:
     goal = (user_goal or "").strip()
     header = "你将作为创作助手阅读用户文档，并给出可直接采纳的建议。"

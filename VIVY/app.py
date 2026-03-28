@@ -27,7 +27,12 @@ from db import (
     delete_conversation_turn,
 )
 from deepseek_client import deepseek_chat, deepseek_chat_stream
-from creative_assist import LoadedDocument, build_creative_prompt
+from creative_assist import (
+    LoadedDocument,
+    OFFICE_PASSAGE_MAX,
+    build_creative_prompt,
+    build_office_passage_prompt,
+)
 from prompts import (
     CHAT_PROMPT_TEMPLATE,
     INSPIRATION_JSON_PROMPT,
@@ -962,6 +967,85 @@ def api_creative_doc_stream():
             yield "data: {\"done\": true}\n\n"
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream")
+
+
+@app.route("/api/office_passage_stream", methods=["OPTIONS"])
+def api_office_passage_stream_options():
+    """供 WPS/Word 加载项内嵌 WebView 做跨域预检（本机服务）。"""
+    r = Response("", status=204)
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    r.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    r.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    r.headers["Access-Control-Max-Age"] = "86400"
+    return r
+
+
+@app.post("/api/office_passage_stream")
+def api_office_passage_stream():
+    """
+    办公软件内「内置感」辅助：由 WPS/Word 加载项（或 COM 桥）把当前选区 POST 到此接口，
+    流式返回建议/润色/续写结果；用户无需离开编辑器窗口。
+    JSON: user_id, passage, action (polish|continue|critique|improve|free), goal?, context_excerpt?
+    """
+    data = request.get_json(force=True) or {}
+    user_id = (data.get("user_id") or "").strip()
+    passage = (data.get("passage") or "").strip()
+    action = (data.get("action") or "polish").strip().lower()
+    goal = (data.get("goal") or "").strip()
+    context_excerpt = (data.get("context_excerpt") or "").strip()
+
+    if not user_id:
+        return _json_response({"error": "missing user_id"}, 400)
+    if not passage:
+        return _json_response({"error": "missing passage"}, 400)
+    if len(passage) > OFFICE_PASSAGE_MAX:
+        passage = passage[:OFFICE_PASSAGE_MAX]
+
+    ensure_user(user_id)
+
+    try:
+        prompt = build_office_passage_prompt(
+            passage, action=action, user_goal=goal or None, context_excerpt=context_excerpt or None
+        )
+    except ValueError as e:
+        return _json_response({"error": str(e)}, 400)
+
+    excerpt = passage[:400].replace("\n", " ")
+    user_turn = f"[Office选区] action={action}\n摘录：{excerpt}"
+    _record_user_turn(user_id, user_turn, chat_mode="creative", interest_signal=None)
+
+    messages = [
+        {
+            "role": "system",
+            "content": VIVY_SYSTEM_PROMPT + "\n\n你现在处于【办公软件内嵌辅助模式】：输出要便于用户直接粘贴回文档，少套话。",
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    def gen():
+        full = ""
+        try:
+            for chunk in deepseek_chat_stream(messages=messages, temperature=0.85, max_tokens=1200, timeout=90):
+                if not chunk:
+                    continue
+                full += chunk
+                payload = json.dumps({"delta": chunk}, ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+        except Exception as e:
+            payload = json.dumps({"error": str(e)}, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+        finally:
+            reply = (full or "").strip()
+            if reply:
+                _record_assistant_text(user_id, reply, chat_mode="creative")
+                log_interaction(
+                    user_id, topic="Office选区辅助", sentiment="neutral", content=f"{action}:{excerpt[:120]}"
+                )
+            yield "data: {\"done\": true}\n\n"
+
+    resp = Response(stream_with_context(gen()), mimetype="text/event-stream")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
 
 
 if __name__ == "__main__":
