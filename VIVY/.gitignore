@@ -14,6 +14,8 @@ venv/
 vivy.sqlite
 *.sqlite3
 .desktop_user_id
+.vivy_immersive_autosave.md
+.immersive_recent.json
 
 build/
 dist/
