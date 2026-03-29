@@ -32,6 +32,7 @@ from creative_assist import (
     OFFICE_PASSAGE_MAX,
     build_creative_prompt,
     build_office_passage_prompt,
+    normalize_office_reference_docs,
 )
 from prompts import (
     CHAT_PROMPT_TEMPLATE,
@@ -985,7 +986,8 @@ def api_office_passage_stream():
     """
     办公软件内「内置感」辅助：由 WPS/Word 加载项（或 COM 桥）把当前选区 POST 到此接口，
     流式返回建议/润色/续写结果；用户无需离开编辑器窗口。
-    JSON: user_id, passage, action (polish|continue|critique|improve|free), goal?, context_excerpt?
+    JSON: user_id, passage, action (polish|continue|critique|improve|free), goal?, context_excerpt?,
+          reference_docs? (list of {label|name, text})
     """
     data = request.get_json(force=True) or {}
     user_id = (data.get("user_id") or "").strip()
@@ -993,6 +995,7 @@ def api_office_passage_stream():
     action = (data.get("action") or "polish").strip().lower()
     goal = (data.get("goal") or "").strip()
     context_excerpt = (data.get("context_excerpt") or "").strip()
+    reference_docs = normalize_office_reference_docs(data.get("reference_docs"))
 
     if not user_id:
         return _json_response({"error": "missing user_id"}, 400)
@@ -1005,7 +1008,11 @@ def api_office_passage_stream():
 
     try:
         prompt = build_office_passage_prompt(
-            passage, action=action, user_goal=goal or None, context_excerpt=context_excerpt or None
+            passage,
+            action=action,
+            user_goal=goal or None,
+            context_excerpt=context_excerpt or None,
+            reference_docs=reference_docs or None,
         )
     except ValueError as e:
         return _json_response({"error": str(e)}, 400)

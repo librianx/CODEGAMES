@@ -25,6 +25,7 @@ from PyQt6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
     pyqtProperty,
+    QEvent,
 )
 from PyQt6.QtGui import QAction, QMouseEvent, QMovie, QImageReader
 from PyQt6.QtGui import QGuiApplication
@@ -63,12 +64,6 @@ from app import app as flask_app
 from db import init_db
 from creative_assist import load_document_text
 from immersive_writing import ImmersiveWritingWindow
-from speech import (
-    recognize_once,
-    speak_text_async,
-    stt_culture_optional,
-    stt_timeout_seconds,
-)
 
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
@@ -84,17 +79,6 @@ def _ease_out_cubic(t: float) -> float:
     t = max(0.0, min(1.0, t))
     p = 1.0 - t
     return 1.0 - p * p * p
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = str(os.getenv(name, 'true' if default else 'false')).strip().lower()
-    return raw in ('1', 'true', 'yes', 'y', 'on')
-
-
-class TtsErrorBridge(QObject):
-    """TTS 在后台线程失败时，通过信号回到主线程更新气泡。"""
-
-    failed = pyqtSignal(str)
 
 
 class WorkerSignals(QObject):
@@ -552,13 +536,6 @@ class DesktopPet(QWidget):
         # bubble priority: prevent system/status messages from overwriting replies
         self._bubble_lock_until_ts = 0.0
 
-        # voice
-        self.auto_voice_reply = _env_bool('VIVY_AUTO_VOICE_REPLY', True)
-        self.stream_tts_enabled = _env_bool('VIVY_STREAM_TTS', True)
-        self._stream_tts_buffer = ""
-        self._tts_error_bridge = TtsErrorBridge(self)
-        self._tts_error_bridge.failed.connect(self._on_tts_playback_failed)
-
         self._build_ui()
         self._init_session()
         self._start_idle_watch()
@@ -719,15 +696,6 @@ class DesktopPet(QWidget):
         self.btn_send = QPushButton("发送")
         self.btn_send.clicked.connect(self._send_from_input)
         input_row.addWidget(self.btn_send)
-
-        self.btn_voice = QPushButton("🎤语音")
-        self.btn_voice.clicked.connect(self._start_voice_input)
-        input_row.addWidget(self.btn_voice)
-
-        self.btn_voice_toggle = QPushButton()
-        self.btn_voice_toggle.clicked.connect(self._toggle_auto_voice_reply)
-        input_row.addWidget(self.btn_voice_toggle)
-        self._update_voice_toggle_button()
 
         self.controls_layout.addLayout(input_row)
 
@@ -915,6 +883,8 @@ class DesktopPet(QWidget):
         self._apply_window_size()
         self.move(100, 120)
         self._set_interest_signal("")
+        for _w in (self.image_label, self.domain_aura, self.avatar_dock):
+            _w.installEventFilter(self)
 
     def _setup_avatar(self):
         # Use GIF as initial avatar; keep aspect ratio and smooth scaling.
@@ -983,10 +953,6 @@ class DesktopPet(QWidget):
         self.btn_question.setDisabled(busy)
         self.btn_send.setDisabled(busy)
         self.input_edit.setDisabled(busy)
-        if hasattr(self, 'btn_voice'):
-            self.btn_voice.setDisabled(busy)
-        if hasattr(self, 'btn_voice_toggle'):
-            self.btn_voice_toggle.setDisabled(False)
         self.btn_interest_yes.setDisabled(busy)
         self.btn_interest_no.setDisabled(busy)
         self.btn_interest_clear.setDisabled(busy)
@@ -1039,109 +1005,13 @@ class DesktopPet(QWidget):
             self.btn_copy_reply.setText("已复制")
             QTimer.singleShot(800, lambda: self.btn_copy_reply.setText("复制回复"))
 
-    def _update_voice_toggle_button(self):
-        if hasattr(self, 'btn_voice_toggle'):
-            self.btn_voice_toggle.setText(f"语音回放：{'开' if self.auto_voice_reply else '关'}")
-
-    def _toggle_auto_voice_reply(self):
-        self._touch()
-        self.auto_voice_reply = not self.auto_voice_reply
-        self._update_voice_toggle_button()
-        self._set_status_text(f"语音回放已{'开启' if self.auto_voice_reply else '关闭'}。")
-
-    def _on_tts_playback_failed(self, msg: str):
-        clean = (msg or "").strip()
-        if len(clean) > 220:
-            clean = clean[:220] + "…"
-        self._set_status_text(f"语音播报失败：{clean}")
-
-    def _start_voice_input(self):
-        self._touch()
-
-        def _request():
-            text = recognize_once(
-                timeout_seconds=stt_timeout_seconds(),
-                culture=stt_culture_optional(),
-            )
-            return {"text": text}
-
-        def _ok(data):
-            text = ((data or {}).get('text') or '').strip()
-            if not text:
-                self._set_status_text('没有识别到有效文字。')
-                return
-            self.input_edit.setText(text)
-            self.input_edit.setFocus()
-            self._send_from_input()
-
-        def _err(error_msg):
-            self._set_status_text(f"语音识别失败：{error_msg}")
-
-        self._run_async(_request, _ok, _err, thinking_text='VIVY 正在听你说话...')
-
-    def _maybe_speak_reply(self, text: str):
-        spoken = (text or "").strip()
-        if not spoken or not self.auto_voice_reply:
-            return
-        speak_text_async(
-            spoken,
-            on_error=lambda m: self._tts_error_bridge.failed.emit(m),
-        )
-
-    def _split_stream_tts_units(self, buffer_text: str, flush: bool = False):
-        text = buffer_text or ''
-        if not text:
-            return [], ''
-        strong_seps = '。！？!?\n'
-        out = []
-        start = 0
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            if ch in strong_seps:
-                end = i + 1
-                while end < len(text) and text[end] in '”」』）】 ':
-                    end += 1
-                unit = text[start:end].strip()
-                if unit:
-                    out.append(unit)
-                start = end
-            i += 1
-        remain = text[start:].strip()
-        if flush and remain:
-            out.append(remain)
-            remain = ''
-        return out, remain
-
-    def _on_stream_tts_progress(self, payload):
+    def _on_stream_chat_progress(self, payload):
         if isinstance(payload, dict):
-            partial = str(payload.get('partial') or '')
-            delta = str(payload.get('delta') or '')
+            partial = str(payload.get("partial") or "")
         else:
-            partial = str(payload or '')
-            delta = ''
+            partial = str(payload or "")
         if partial:
             self._set_bubble_text(partial)
-        if not (self.auto_voice_reply and self.stream_tts_enabled and delta):
-            return
-        self._stream_tts_buffer += delta
-        units, remain = self._split_stream_tts_units(self._stream_tts_buffer, flush=False)
-        self._stream_tts_buffer = remain
-        for unit in units:
-            self._maybe_speak_reply(unit)
-
-    def _spoken_text_from_messages(self, messages):
-        for msg in messages or []:
-            mtype = msg.get('type')
-            if mtype == 'chat':
-                return (msg.get('text') or '').strip()
-            if mtype == 'inspiration':
-                return (
-                    f"今日冲浪见闻。发现：{msg.get('discovery', '')}。"
-                    f"联想：{msg.get('vivy_association', '')}。"
-                    f"{msg.get('invitation_question', '')}"
-                ).strip()
-        return ''
 
     def _clear_option_buttons(self):
         for i in reversed(range(self.options_layout.count())):
@@ -1630,9 +1500,6 @@ class DesktopPet(QWidget):
             def _ok(data):
                 messages = data.get("messages", [])
                 self._handle_messages(messages)
-                spoken = self._spoken_text_from_messages(messages)
-                if spoken:
-                    self._maybe_speak_reply(spoken)
                 self._refresh_memory(silent=True)
 
             def _err(error_msg):
@@ -1655,7 +1522,6 @@ class DesktopPet(QWidget):
             import json
 
             assembled = ""
-            self._stream_tts_buffer = ""
             for raw in resp.iter_lines(decode_unicode=True):
                 if not raw:
                     continue
@@ -1675,25 +1541,14 @@ class DesktopPet(QWidget):
                 delta = obj.get("delta") or ""
                 if delta:
                     assembled += delta
-                    # 返回“当前累计文本”和“本次增量”，用于 UI 实时刷新和流式播报
                     yield {"partial": assembled, "delta": delta}
 
             return assembled
 
         def _ok_stream(data):
-            reply_text = ((data or {}).get("text") or "").strip()
-            if self.auto_voice_reply:
-                if self.stream_tts_enabled:
-                    units, _remain = self._split_stream_tts_units(self._stream_tts_buffer, flush=True)
-                    self._stream_tts_buffer = ""
-                    for unit in units:
-                        self._maybe_speak_reply(unit)
-                elif reply_text:
-                    self._maybe_speak_reply(reply_text)
             self._refresh_memory(silent=True)
 
         def _err_stream(error_msg):
-            self._stream_tts_buffer = ""
             self._set_status_text(f"请求失败：{error_msg}")
 
         def _consume(progress_callback=None):
@@ -1711,14 +1566,13 @@ class DesktopPet(QWidget):
             _consume,
             _ok_stream,
             _err_stream,
-            on_progress=self._on_stream_tts_progress,
+            on_progress=self._on_stream_chat_progress,
             thinking_text="VIVY 思考中（流式输出）...",
         )
 
     def _touch(self):
+        """刷新「活跃时间」；待机收起时不会自动展开，需双击头像区域唤醒。"""
         self._last_interaction_ts = time.time()
-        if self._idle_collapsed:
-            self._set_idle_collapsed(False)
 
     def _set_idle_collapsed(self, collapsed: bool):
         if collapsed == self._idle_collapsed:
@@ -1757,11 +1611,15 @@ class DesktopPet(QWidget):
             self._set_idle_collapsed(True)
 
     def eventFilter(self, obj, event):
-        # Any key/mouse interaction in input should prevent idle collapse.
         try:
+            if event.type() == QEvent.Type.MouseButtonDblClick:
+                if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
+                    if obj in (self.image_label, self.domain_aura, self.avatar_dock):
+                        self._last_interaction_ts = time.time()
+                        self._set_idle_collapsed(not self._idle_collapsed)
+                        return True
             if obj is self.input_edit:
                 et = event.type()
-                # KeyPress/KeyRelease/MouseButtonPress/FocusIn all imply interaction
                 if et in (
                     event.Type.KeyPress,
                     event.Type.KeyRelease,
@@ -1845,17 +1703,65 @@ class DesktopPet(QWidget):
 
     def _set_idle_timeout_interactive(self):
         self._touch()
-        value, ok = QInputDialog.getInt(
-            self,
-            "设置待机时长",
-            "多少秒不操作后进入待机：",
-            int(self._idle_timeout_s),
-            5,
-            3600,
-            1,
+        dlg = QInputDialog(self)
+        dlg.setInputMode(QInputDialog.InputMode.IntInput)
+        dlg.setWindowTitle("设置待机时长")
+        dlg.setLabelText("多少秒不操作后进入待机：")
+        dlg.setIntValue(int(self._idle_timeout_s))
+        dlg.setIntMinimum(5)
+        dlg.setIntMaximum(3600)
+        dlg.setIntStep(1)
+        dlg.setStyleSheet(
+            """
+            QInputDialog {
+                background-color: #0c141d;
+            }
+            QLabel {
+                color: #eaf8ff;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            QSpinBox {
+                color: #04131c;
+                background-color: #dff6ff;
+                border: 2px solid #46c9ee;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-size: 15px;
+                font-weight: 600;
+                min-height: 28px;
+                selection-background-color: rgba(55, 214, 255, 160);
+                selection-color: #04131c;
+            }
+            QSpinBox:focus {
+                border: 2px solid #7be2ff;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 22px;
+                background: #2b9ec5;
+                border-left: 1px solid #46c9ee;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background: #3ab8de;
+            }
+            QPushButton {
+                background-color: #2b9ec5;
+                border: 1px solid #7be2ff;
+                border-radius: 8px;
+                color: #04131c;
+                padding: 6px 16px;
+                font-size: 13px;
+                font-weight: 600;
+                min-width: 72px;
+            }
+            QPushButton:hover {
+                background-color: #3ab8de;
+            }
+            """
         )
-        if not ok:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        value = dlg.intValue()
 
         self._idle_timeout_s = int(value)
         _save_env_value("VIVY_IDLE_TIMEOUT", str(self._idle_timeout_s))
@@ -1913,7 +1819,6 @@ class DesktopPet(QWidget):
             import json
 
             assembled = ""
-            self._stream_tts_buffer = ""
             for raw in resp.iter_lines(decode_unicode=True):
                 if not raw:
                     continue
@@ -1988,10 +1893,12 @@ class DesktopPet(QWidget):
             event.accept()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        self._touch()
         if event.button() == Qt.MouseButton.LeftButton:
+            self._last_interaction_ts = time.time()
             self._set_idle_collapsed(not self._idle_collapsed)
             event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 def run_flask_background(port: int):

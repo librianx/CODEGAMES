@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -57,6 +57,37 @@ def load_document_text(path: str, max_chars: int = 60_000) -> LoadedDocument:
 # WPS/Word 加载项或 COM 桥：选区辅助（短请求，适合边写边点）
 OFFICE_PASSAGE_MAX = 14_000
 OFFICE_CONTEXT_MAX = 5_000
+# 沉浸写作 / Office 辅助：用户投喂的参考文档总上限（与 passage 分开计费）
+OFFICE_REFERENCE_MAX_PER_DOC = 10_000
+OFFICE_REFERENCE_MAX_TOTAL = 22_000
+
+def normalize_office_reference_docs(raw: Any) -> list[tuple[str, str]]:
+    """解析客户端 reference_docs，按总字数预算截断。每项为 (显示名, 正文)。"""
+    out: list[tuple[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    budget = OFFICE_REFERENCE_MAX_TOTAL
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("name") or "参考文档").strip() or "参考文档"
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        cap = min(OFFICE_REFERENCE_MAX_PER_DOC, max(0, budget))
+        if cap <= 0:
+            break
+        if len(text) > cap:
+            ellip = "\n…（已截断）"
+            take = max(0, cap - len(ellip))
+            text = text[:take] + ellip
+        label = label[:200]
+        out.append((label, text))
+        budget -= len(text)
+        if budget <= 0:
+            break
+    return out
+
 
 OFFICE_ACTION_HINTS = {
     "polish": "请只针对【选中文本】做润色：保留原意与人称，输出一版可直接替换的正文（不要前言后语）。",
@@ -72,6 +103,7 @@ def build_office_passage_prompt(
     action: str = "polish",
     user_goal: Optional[str] = None,
     context_excerpt: Optional[str] = None,
+    reference_docs: Optional[list[tuple[str, str]]] = None,
 ) -> str:
     passage = (passage or "").strip()
     if not passage:
@@ -91,6 +123,16 @@ def build_office_passage_prompt(
     ]
     if goal and act != "free":
         parts.append(f"用户补充说明：{goal}")
+    ref_list = reference_docs or []
+    if ref_list:
+        ref_chunks = []
+        for label, body in ref_list:
+            ref_chunks.append(f"【参考文档：{label}】\n{body}")
+        parts.append(
+            "下列【参考文档】由用户主动投喂，与本次写作相关。辅助时请结合其中设定、事实与风格；"
+            "不要编造与参考明显矛盾的内容；若与当前选区无关可少引用。\n\n"
+            + "\n\n---\n\n".join(ref_chunks)
+        )
     if ctx:
         parts.append(
             "【附近上下文（仅供参考，勿大段复述）】\n"

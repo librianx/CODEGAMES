@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
@@ -28,7 +30,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from creative_assist import OFFICE_CONTEXT_MAX, OFFICE_PASSAGE_MAX
+from creative_assist import (
+    OFFICE_CONTEXT_MAX,
+    OFFICE_PASSAGE_MAX,
+    OFFICE_REFERENCE_MAX_PER_DOC,
+    load_document_text,
+)
 
 if TYPE_CHECKING:
     from desktop_pet import DesktopPet
@@ -87,6 +94,8 @@ class ImmersiveWritingWindow(QWidget):
         self._current_path: Path | None = None
         self._dirty = False
         self._suppress_dirty = False
+        # 本次写作会话投喂的参考文档（name + 正文，不随稿纸文件保存）
+        self._reference_items: list[dict[str, str]] = []
 
         self.setWindowTitle("VIVY 沉浸写作")
         self.setMinimumSize(640, 420)
@@ -203,6 +212,37 @@ class ImmersiveWritingWindow(QWidget):
         bar2.addStretch(1)
         root.addLayout(bar2)
 
+        ref_btns = QHBoxLayout()
+        ref_btns.setSpacing(6)
+        self.btn_ref_add = mk_btn("添加参考文档", self._add_reference_document)
+        self.btn_ref_add.setToolTip(
+            "投喂与本次写作相关的设定、大纲、年表、书摘等；润色/续写/点评时会一并交给 VIVY。\n"
+            "支持 txt / md / docx / pdf，单份最多约 "
+            f"{OFFICE_REFERENCE_MAX_PER_DOC // 1000}k 字，多份合计由服务端再截断。"
+        )
+        self.btn_ref_remove = mk_btn("移除所选", self._remove_selected_reference)
+        self.btn_ref_clear = mk_btn("清空参考", self._clear_reference_documents)
+        for w in (self.btn_ref_add, self.btn_ref_remove, self.btn_ref_clear):
+            ref_btns.addWidget(w)
+        ref_btns.addStretch(1)
+        self.lbl_ref_status = QLabel("参考文档：未投喂")
+        self.lbl_ref_status.setObjectName("imBarLbl")
+        self.lbl_ref_status.setStyleSheet("color: rgba(160, 210, 235, 200);")
+        ref_btns.addWidget(self.lbl_ref_status)
+
+        self.list_ref = QListWidget()
+        self.list_ref.setMaximumHeight(80)
+        self.list_ref.setToolTip("已加入的参考文档；选中一行后点「移除所选」。")
+
+        ref_col = QVBoxLayout()
+        ref_col.setSpacing(4)
+        ref_col.setContentsMargins(0, 0, 0, 0)
+        ref_col.addLayout(ref_btns)
+        ref_col.addWidget(self.list_ref)
+        ref_wrap = QWidget()
+        ref_wrap.setLayout(ref_col)
+        root.addWidget(ref_wrap)
+
         self.assist_wrap = QWidget()
         aw = QVBoxLayout(self.assist_wrap)
         aw.setContentsMargins(0, 0, 0, 0)
@@ -213,7 +253,7 @@ class ImmersiveWritingWindow(QWidget):
         self.editor.setPlaceholderText(
             "在此专注写作…\n"
             "快捷键：Ctrl+S / O / N / F，F11 全屏，Esc 退出全屏。\n"
-            "选中一段再点润色等；未选则对全文。"
+            "可先「添加参考文档」投喂设定/大纲；选中一段再点润色等，未选则对全文。"
         )
         self.editor.textChanged.connect(self._on_text_changed)
         ef = QFont(self.editor.font())
@@ -268,6 +308,78 @@ class ImmersiveWritingWindow(QWidget):
             b.setDisabled(busy)
         for b in self._assist_output_buttons:
             b.setDisabled(busy)
+        for b in (self.btn_ref_add, self.btn_ref_remove, self.btn_ref_clear):
+            b.setDisabled(busy)
+
+    def _rebuild_reference_list_widget(self) -> None:
+        self.list_ref.clear()
+        for it in self._reference_items:
+            n = len(it["text"].replace("\n", "").replace("\r", ""))
+            item = QListWidgetItem(f"{it['name']}  （{n} 字）")
+            item.setData(Qt.ItemDataRole.UserRole, it["path"])
+            self.list_ref.addItem(item)
+        total = sum(
+            len(x["text"].replace("\n", "").replace("\r", "")) for x in self._reference_items
+        )
+        if not self._reference_items:
+            self.lbl_ref_status.setText("参考文档：未投喂")
+        else:
+            self.lbl_ref_status.setText(
+                f"参考文档：{len(self._reference_items)} 份 · 约 {total} 字（提交时可能再截断）"
+            )
+
+    def _add_reference_document(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择参考文档（设定、大纲、年表等）",
+            str(PROJECT_DIR),
+            "Documents (*.txt *.md *.docx *.pdf);;All Files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            doc = load_document_text(path, max_chars=OFFICE_REFERENCE_MAX_PER_DOC)
+        except Exception as e:
+            QMessageBox.warning(self, "沉浸写作", f"无法读取文档：{e}")
+            return
+        name = Path(doc.path).name
+        replaced = False
+        for i, it in enumerate(self._reference_items):
+            if it["path"] == doc.path:
+                self._reference_items[i] = {"path": doc.path, "name": name, "text": doc.text}
+                replaced = True
+                break
+        if not replaced:
+            self._reference_items.append({"path": doc.path, "name": name, "text": doc.text})
+        self._rebuild_reference_list_widget()
+        self._pet._set_status_text(
+            f"已{'更新' if replaced else '添加'}参考文档：{name}"
+        )
+
+    def _remove_selected_reference(self) -> None:
+        row = self.list_ref.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "沉浸写作", "请先在列表中选中要移除的参考文档。")
+            return
+        item = self.list_ref.item(row)
+        path = item.data(Qt.ItemDataRole.UserRole)
+        self._reference_items = [x for x in self._reference_items if x["path"] != path]
+        self._rebuild_reference_list_widget()
+
+    def _clear_reference_documents(self) -> None:
+        if not self._reference_items:
+            return
+        r = QMessageBox.question(
+            self,
+            "沉浸写作",
+            "确定清空所有已投喂的参考文档吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._reference_items.clear()
+        self._rebuild_reference_list_widget()
 
     def _on_text_changed(self):
         if self._suppress_dirty:
@@ -525,12 +637,17 @@ class ImmersiveWritingWindow(QWidget):
 
         def _request_stream():
             url = f"{pet.api_base}/api/office_passage_stream"
+            ref_docs = [
+                {"label": x["name"], "text": x["text"]}
+                for x in self._reference_items
+            ]
             payload = {
                 "user_id": pet.user_id,
                 "passage": passage,
                 "action": action,
                 "goal": (goal or "").strip(),
                 "context_excerpt": context_excerpt or "",
+                "reference_docs": ref_docs,
             }
             resp = requests.post(url, json=payload, timeout=30, stream=True)
             resp.raise_for_status()
