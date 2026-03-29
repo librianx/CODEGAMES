@@ -34,7 +34,7 @@ if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 
 py -m PyInstaller --noconfirm --windowed --name "VIVY" --icon "$iconIco" `
   --add-data "static\\images;static\\images" `
-  --add-data ".env.example;." `
+  --add-data "env.example;." `
   desktop_pet.py
 
 $releaseDir = "dist\VIVY-release"
@@ -42,7 +42,7 @@ if (Test-Path $releaseDir) { Remove-Item -Recurse -Force $releaseDir }
 New-Item -ItemType Directory -Path $releaseDir | Out-Null
 
 Copy-Item "dist\VIVY\*" $releaseDir -Recurse -Force
-Copy-Item ".env.example" "$releaseDir\.env.example" -Force
+Copy-Item "env.example" "$releaseDir\.env.example" -Force
 Copy-Item "README.md" "$releaseDir\README.md" -Force
 Copy-Item "start_desktop.bat" "$releaseDir\start_desktop.bat" -Force
 

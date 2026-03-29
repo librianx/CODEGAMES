@@ -212,9 +212,14 @@ class ImmersiveWritingWindow(QWidget):
         bar2.addStretch(1)
         root.addLayout(bar2)
 
+        self.lbl_feed_title = QLabel("文档投喂（设定 / 大纲 / 书摘等，辅助润色与续写）")
+        self.lbl_feed_title.setObjectName("imBarLbl")
+        self.lbl_feed_title.setStyleSheet("color: rgba(120, 220, 255, 255); font-weight: 600; font-size: 12px;")
+        self.lbl_feed_title.setWordWrap(True)
+
         ref_btns = QHBoxLayout()
         ref_btns.setSpacing(6)
-        self.btn_ref_add = mk_btn("添加参考文档", self._add_reference_document)
+        self.btn_ref_add = mk_btn("添加投喂文档", self._add_reference_document)
         self.btn_ref_add.setToolTip(
             "投喂与本次写作相关的设定、大纲、年表、书摘等；润色/续写/点评时会一并交给 VIVY。\n"
             "支持 txt / md / docx / pdf，单份最多约 "
@@ -236,7 +241,8 @@ class ImmersiveWritingWindow(QWidget):
 
         ref_col = QVBoxLayout()
         ref_col.setSpacing(4)
-        ref_col.setContentsMargins(0, 0, 0, 0)
+        ref_col.setContentsMargins(0, 2, 0, 0)
+        ref_col.addWidget(self.lbl_feed_title)
         ref_col.addLayout(ref_btns)
         ref_col.addWidget(self.list_ref)
         ref_wrap = QWidget()
@@ -253,7 +259,7 @@ class ImmersiveWritingWindow(QWidget):
         self.editor.setPlaceholderText(
             "在此专注写作…\n"
             "快捷键：Ctrl+S / O / N / F，F11 全屏，Esc 退出全屏。\n"
-            "可先「添加参考文档」投喂设定/大纲；选中一段再点润色等，未选则对全文。"
+            "可先点上方「添加投喂文档」加入参考；选中一段再点润色等，未选则对全文。"
         )
         self.editor.textChanged.connect(self._on_text_changed)
         ef = QFont(self.editor.font())

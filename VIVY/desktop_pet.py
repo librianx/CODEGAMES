@@ -67,6 +67,12 @@ from immersive_writing import ImmersiveWritingWindow
 
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
+# 快捷按钮「脑洞短剧」发送的固定指令
+IMPROV_SKETCH_MESSAGE = (
+    "即兴写一个脑洞小短剧：共 3～8 行，格式为「场景一句」与「角色名：台词」交替；"
+    "要有一个无厘头误会，结尾用一句反转或金句收束；不要写作课讲解，不要正式标题以外的套话。"
+)
+
 PROJECT_DIR = Path(__file__).resolve().parent
 USER_ID_FILE = PROJECT_DIR / ".desktop_user_id"
 GIF_PATH = PROJECT_DIR / "static" / "images" / "VIVYfirst.gif"
@@ -529,7 +535,7 @@ class DesktopPet(QWidget):
         self._idle_collapsed = False
         self._last_interaction_ts = time.time()
         self._idle_timeout_s = int(os.getenv("VIVY_IDLE_TIMEOUT", "18"))
-        self._expanded_size = QSize(500, 280)
+        self._expanded_size = QSize(556, 280)
         self._expanded_size_with_memory = QSize(720, 296)
         self._collapsed_size = QSize(170, 170)
 
@@ -667,6 +673,11 @@ class DesktopPet(QWidget):
         self.btn_inspiration = QPushButton("今日灵感")
         self.btn_inspiration.clicked.connect(lambda: self._send_message("今天有什么灵感？"))
         action_row.addWidget(self.btn_inspiration)
+
+        self.btn_improv_sketch = QPushButton("脑洞短剧")
+        self.btn_improv_sketch.setToolTip("即兴生成一段无厘头小剧场（对白 + 场景）")
+        self.btn_improv_sketch.clicked.connect(lambda: self._send_message(IMPROV_SKETCH_MESSAGE))
+        action_row.addWidget(self.btn_improv_sketch)
 
         self.btn_question = QPushButton("换个问题")
         self.btn_question.clicked.connect(lambda: self._send_message("换个问题"))
@@ -950,6 +961,7 @@ class DesktopPet(QWidget):
     def _set_busy(self, busy: bool, thinking_text: str | None = "VIVY 思考中..."):
         self._busy = busy
         self.btn_inspiration.setDisabled(busy)
+        self.btn_improv_sketch.setDisabled(busy)
         self.btn_question.setDisabled(busy)
         self.btn_send.setDisabled(busy)
         self.input_edit.setDisabled(busy)
