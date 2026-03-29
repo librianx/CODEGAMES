@@ -62,7 +62,13 @@ from PyQt6.QtWidgets import (
 from app import app as flask_app
 from db import init_db
 from creative_assist import load_document_text
-from speech import recognize_once, speak_text_async
+from immersive_writing import ImmersiveWritingWindow
+from speech import (
+    recognize_once,
+    speak_text_async,
+    stt_culture_optional,
+    stt_timeout_seconds,
+)
 
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
@@ -83,6 +89,12 @@ def _ease_out_cubic(t: float) -> float:
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = str(os.getenv(name, 'true' if default else 'false')).strip().lower()
     return raw in ('1', 'true', 'yes', 'y', 'on')
+
+
+class TtsErrorBridge(QObject):
+    """TTS 在后台线程失败时，通过信号回到主线程更新气泡。"""
+
+    failed = pyqtSignal(str)
 
 
 class WorkerSignals(QObject):
@@ -527,13 +539,14 @@ class DesktopPet(QWidget):
         self.current_interest_signal = ""
         self.chat_mode = "chat"
         self._loaded_doc_path: str | None = None
+        self._immersive_writing_window: ImmersiveWritingWindow | None = None
 
         # idle / wander
         self._idle_collapsed = False
         self._last_interaction_ts = time.time()
         self._idle_timeout_s = int(os.getenv("VIVY_IDLE_TIMEOUT", "18"))
-        self._expanded_size = QSize(500, 256)
-        self._expanded_size_with_memory = QSize(720, 272)
+        self._expanded_size = QSize(500, 280)
+        self._expanded_size_with_memory = QSize(720, 296)
         self._collapsed_size = QSize(170, 170)
 
         # bubble priority: prevent system/status messages from overwriting replies
@@ -542,7 +555,9 @@ class DesktopPet(QWidget):
         # voice
         self.auto_voice_reply = _env_bool('VIVY_AUTO_VOICE_REPLY', True)
         self.stream_tts_enabled = _env_bool('VIVY_STREAM_TTS', True)
-        self._stream_tts_buffer = ''
+        self._stream_tts_buffer = ""
+        self._tts_error_bridge = TtsErrorBridge(self)
+        self._tts_error_bridge.failed.connect(self._on_tts_playback_failed)
 
         self._build_ui()
         self._init_session()
@@ -610,9 +625,13 @@ class DesktopPet(QWidget):
 
         self.creative_actions = QWidget()
         self.creative_actions.setObjectName("creativeDomainActions")
-        ca_layout = QHBoxLayout(self.creative_actions)
-        ca_layout.setContentsMargins(2, 0, 2, 0)
-        ca_layout.setSpacing(4)
+        ca_outer = QVBoxLayout(self.creative_actions)
+        ca_outer.setContentsMargins(2, 0, 2, 0)
+        ca_outer.setSpacing(3)
+        ca_row1 = QHBoxLayout()
+        ca_row1.setSpacing(4)
+        ca_row2 = QHBoxLayout()
+        ca_row2.setSpacing(4)
 
         self.btn_domain_doc = QPushButton("读文档")
         self.btn_domain_doc.setObjectName("vivyDomainBtn")
@@ -630,16 +649,28 @@ class DesktopPet(QWidget):
         self.btn_domain_clear.setToolTip("清除已读取的文档参考状态")
         self.btn_domain_clear.clicked.connect(self._clear_loaded_document)
 
+        self.btn_domain_immerse = QPushButton("沉浸写作")
+        self.btn_domain_immerse.setObjectName("vivyDomainBtn")
+        self.btn_domain_immerse.setToolTip("大屏专注写作（仅 VIVY 内）")
+        self.btn_domain_immerse.clicked.connect(self._open_immersive_writing)
+
         self._creative_domain_buttons = [
             self.btn_domain_doc,
             self.btn_domain_spark,
             self.btn_domain_clear,
+            self.btn_domain_immerse,
         ]
         for b in self._creative_domain_buttons:
             op = QGraphicsOpacityEffect(b)
             op.setOpacity(0.0)
             b.setGraphicsEffect(op)
-            ca_layout.addWidget(b)
+        for b in (self.btn_domain_doc, self.btn_domain_spark, self.btn_domain_clear):
+            ca_row1.addWidget(b)
+        ca_row1.addStretch(1)
+        ca_row2.addWidget(self.btn_domain_immerse)
+        ca_row2.addStretch(1)
+        ca_outer.addLayout(ca_row1)
+        ca_outer.addLayout(ca_row2)
         self.creative_actions.hide()
 
         self.domain_aura = CreativeDomainEffects()
@@ -961,6 +992,9 @@ class DesktopPet(QWidget):
         self.btn_interest_clear.setDisabled(busy)
         for b in getattr(self, "_creative_domain_buttons", []):
             b.setDisabled(busy)
+        iw = getattr(self, "_immersive_writing_window", None)
+        if iw is not None:
+            iw.set_assist_busy(busy)
         # Keep memory module interactive even when chatting is busy.
         if busy and thinking_text:
             self._set_bubble_text(thinking_text, kind="thinking")
@@ -1015,14 +1049,21 @@ class DesktopPet(QWidget):
         self._update_voice_toggle_button()
         self._set_status_text(f"语音回放已{'开启' if self.auto_voice_reply else '关闭'}。")
 
+    def _on_tts_playback_failed(self, msg: str):
+        clean = (msg or "").strip()
+        if len(clean) > 220:
+            clean = clean[:220] + "…"
+        self._set_status_text(f"语音播报失败：{clean}")
+
     def _start_voice_input(self):
         self._touch()
 
         def _request():
-            timeout_seconds = max(3, int(os.getenv('VIVY_STT_TIMEOUT', '8')))
-            culture = (os.getenv('VIVY_STT_CULTURE') or '').strip()
-            text = recognize_once(timeout_seconds=timeout_seconds, culture=culture or None)
-            return {'text': text}
+            text = recognize_once(
+                timeout_seconds=stt_timeout_seconds(),
+                culture=stt_culture_optional(),
+            )
+            return {"text": text}
 
         def _ok(data):
             text = ((data or {}).get('text') or '').strip()
@@ -1039,10 +1080,13 @@ class DesktopPet(QWidget):
         self._run_async(_request, _ok, _err, thinking_text='VIVY 正在听你说话...')
 
     def _maybe_speak_reply(self, text: str):
-        spoken = (text or '').strip()
+        spoken = (text or "").strip()
         if not spoken or not self.auto_voice_reply:
             return
-        speak_text_async(spoken)
+        speak_text_async(
+            spoken,
+            on_error=lambda m: self._tts_error_bridge.failed.emit(m),
+        )
 
     def _split_stream_tts_units(self, buffer_text: str, flush: bool = False):
         text = buffer_text or ''
@@ -1244,7 +1288,7 @@ class DesktopPet(QWidget):
             self.interest_label.setText("兴趣：未选择")
 
     def _sync_avatar_dock_heights(self):
-        extra = 34 if self.chat_mode == "creative" else 0
+        extra = 58 if self.chat_mode == "creative" else 0
         self.avatar_dock.setMinimumHeight(198 + extra)
         self.avatar_dock.setMaximumHeight(248 + extra)
         self._apply_window_size()
@@ -1768,6 +1812,7 @@ class DesktopPet(QWidget):
         act_set_idle_timeout = QAction("设置待机时长", self)
         act_load_doc = QAction("读取文档（创作辅助）", self)
         act_clear_doc = QAction("清除已读取文档", self)
+        act_immersive = QAction("沉浸写作窗口…", self)
         act_quit = QAction("退出 VIVY", self)
 
         act_reset.triggered.connect(self._reset_user)
@@ -1777,6 +1822,7 @@ class DesktopPet(QWidget):
         act_set_idle_timeout.triggered.connect(self._set_idle_timeout_interactive)
         act_load_doc.triggered.connect(self._load_document_for_creative)
         act_clear_doc.triggered.connect(self._clear_loaded_document)
+        act_immersive.triggered.connect(self._open_immersive_writing)
         act_quit.triggered.connect(QApplication.instance().quit)
 
         menu.addAction(act_reset)
@@ -1787,6 +1833,7 @@ class DesktopPet(QWidget):
         menu.addSeparator()
         menu.addAction(act_load_doc)
         menu.addAction(act_clear_doc)
+        menu.addAction(act_immersive)
         menu.addSeparator()
         menu.addAction(act_quit)
         menu.exec(event.globalPos())
@@ -1836,6 +1883,15 @@ class DesktopPet(QWidget):
             return
 
         self._start_creative_doc_stream(path, (goal or "").strip())
+
+    def _open_immersive_writing(self):
+        self._touch()
+        if self._immersive_writing_window is None:
+            self._immersive_writing_window = ImmersiveWritingWindow(self)
+            self._immersive_writing_window.set_assist_busy(self._busy)
+        self._immersive_writing_window.show()
+        self._immersive_writing_window.raise_()
+        self._immersive_writing_window.activateWindow()
 
     def _start_creative_doc_stream(self, path: str, goal: str = ""):
         """菜单「读取文档」与创作形态下拖放共用：流式调用 creative_doc_stream。"""

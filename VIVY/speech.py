@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 import requests
 
@@ -116,6 +116,19 @@ Write-Output $result.Text
     if not text:
         raise RuntimeError("没有识别到有效文字。")
     return text
+
+
+def stt_timeout_seconds() -> int:
+    """与 .env 一致，供桌宠等调用（含引号剥离）。"""
+    try:
+        return max(3, int(_env("VIVY_STT_TIMEOUT", "8")))
+    except ValueError:
+        return 8
+
+
+def stt_culture_optional() -> Optional[str]:
+    c = _env("VIVY_STT_CULTURE", "").strip()
+    return c or None
 
 
 # =========================
@@ -627,7 +640,8 @@ def speak_text(text: str):
                 raise
 
 
-def speak_text_async(text: str):
+def speak_text_async(text: str, on_error: Optional[Callable[[str], None]] = None):
+    """后台播报；on_error 可能在非 UI 线程调用，请自行切回主线程再改界面。"""
     clean_text = _normalize_tts_text(text)
     if not clean_text:
         return
@@ -637,6 +651,11 @@ def speak_text_async(text: str):
             speak_text(clean_text)
         except Exception as e:
             print(f"[VIVY TTS] {e}")
+            if on_error is not None:
+                try:
+                    on_error(str(e))
+                except Exception:
+                    pass
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
