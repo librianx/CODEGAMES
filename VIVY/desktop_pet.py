@@ -56,6 +56,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGraphicsOpacityEffect,
 )
 
@@ -64,6 +65,12 @@ from app import app as flask_app
 from db import init_db
 from creative_assist import load_document_text
 from immersive_writing import ImmersiveWritingWindow
+from cursor_agent_api import (
+    format_conversation_text,
+    get_conversation,
+    launch_agent,
+    wait_agent_terminal,
+)
 
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
@@ -1422,6 +1429,142 @@ class DesktopPet(QWidget):
         _save_env_value("DEEPSEEK_API_KEY", new_key)
         self._set_status_text("API Key 已保存，后续请求将使用新配置。")
 
+    def _set_cursor_cloud_agent_key_interactive(self):
+        self._touch()
+        current = (os.getenv("CURSOR_API_KEY") or "").strip()
+        key, ok = QInputDialog.getText(
+            self,
+            "Cursor 云 Agent API Key",
+            "在 dashboard → Cloud Agents → API Keys 创建的密钥（通常 key_ 开头）。\n"
+            "将保存到 .env 的 CURSOR_API_KEY（与 DeepSeek 无关）：",
+            QLineEdit.EchoMode.Password,
+            current,
+        )
+        if not ok:
+            return
+        new_key = (key or "").strip()
+        if not new_key:
+            QMessageBox.warning(self, "提示", "密钥不能为空。")
+            return
+        _save_env_value("CURSOR_API_KEY", new_key)
+        self._set_status_text("Cursor 云 Agent 密钥已保存。")
+
+    def _open_cursor_cloud_agent_dialog(self):
+        self._touch()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Cursor 云 Agent")
+        dlg.resize(500, 400)
+        dlg.setStyleSheet(
+            """
+            QDialog { background-color: #0c141d; color: #eaf8ff; }
+            QLabel { color: #cdeeff; font-size: 12px; }
+            QLineEdit, QTextEdit {
+                background-color: #0a121b;
+                border: 1px solid #46c9ee;
+                border-radius: 8px;
+                color: #f2fbff;
+                padding: 6px;
+                font-size: 12px;
+            }
+            """
+        )
+        hint = QLabel(
+            "在<strong> GitHub 仓库</strong>上启动 Cursor 云 Agent（需控制台 API Key）。\n"
+            "与桌宠日常聊天（DeepSeek）是两套能力；执行时间可能从几十秒到数分钟。"
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.RichText)
+
+        repo = QLineEdit()
+        repo.setPlaceholderText("https://github.com/owner/repo")
+        repo.setText((os.getenv("CURSOR_AGENT_REPO") or "").strip())
+        ref = QLineEdit()
+        ref.setPlaceholderText("main（可留空则使用仓库默认）")
+        ref.setText((os.getenv("CURSOR_AGENT_REF") or "").strip())
+        task = QTextEdit()
+        task.setPlaceholderText("说明要让 Agent 在仓库里完成什么…")
+        task.setMinimumHeight(120)
+
+        form = QFormLayout()
+        form.addRow("仓库 URL", repo)
+        form.addRow("分支 ref", ref)
+        form.addRow("任务说明", task)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(hint)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        repo_s = repo.text().strip()
+        ref_s = ref.text().strip()
+        task_s = task.toPlainText().strip()
+        if not repo_s or not task_s:
+            QMessageBox.warning(self, "Cursor 云 Agent", "请填写仓库 URL 和任务说明。")
+            return
+
+        api_key = (os.getenv("CURSOR_API_KEY") or "").strip()
+        if not api_key:
+            QMessageBox.warning(
+                self,
+                "Cursor 云 Agent",
+                "请先配置 CURSOR_API_KEY：右键菜单 →「设置 Cursor 云 Agent Key」。",
+            )
+            return
+
+        _save_env_value("CURSOR_AGENT_REPO", repo_s)
+        _save_env_value("CURSOR_AGENT_REF", ref_s)
+
+        def _request():
+            created = launch_agent(
+                api_key,
+                prompt_text=task_s,
+                repository=repo_s,
+                ref=ref_s or None,
+            )
+            aid = str(created.get("id") or "").strip()
+            if not aid:
+                raise RuntimeError(f"启动响应缺少 id：{created!r}")
+            final = wait_agent_terminal(api_key, aid)
+            status = str(final.get("status") or "")
+            conv = get_conversation(api_key, aid)
+            body = format_conversation_text(conv)
+            summary = str(final.get("summary") or "").strip()
+            link = ""
+            tgt = final.get("target")
+            if isinstance(tgt, dict):
+                link = str(tgt.get("url") or "").strip()
+            head_parts = [f"【Cursor 云 Agent】状态：{status}"]
+            if summary:
+                head_parts.append(f"摘要：{summary}")
+            if link:
+                head_parts.append(f"链接：{link}")
+            return {"head": "\n".join(head_parts), "body": body}
+
+        def _ok(data):
+            d = data or {}
+            full = ((d.get("head") or "") + "\n\n" + (d.get("body") or "")).strip()
+            self._set_bubble_text(full, kind="reply")
+            self._set_status_text("Cursor 云 Agent 已结束，见气泡正文。")
+
+        def _err(msg):
+            self._set_status_text(f"云 Agent：{msg}")
+
+        self._run_async(
+            _request,
+            _ok,
+            _err,
+            thinking_text="已提交 Cursor 云 Agent，等待结束（可能数分钟）…",
+        )
+
     def _handle_messages(self, messages):
         if not messages:
             return
@@ -1677,6 +1820,8 @@ class DesktopPet(QWidget):
         )
         act_reset = QAction("重置本机用户ID", self)
         act_set_api_key = QAction("设置 API Key", self)
+        act_set_cursor_key = QAction("设置 Cursor 云 Agent Key", self)
+        act_cursor_agent = QAction("运行 Cursor 云 Agent…", self)
         act_toggle_memory = QAction("显示/隐藏记忆模块", self)
         act_toggle_idle = QAction("切换待机收起", self)
         act_set_idle_timeout = QAction("设置待机时长", self)
@@ -1687,6 +1832,8 @@ class DesktopPet(QWidget):
 
         act_reset.triggered.connect(self._reset_user)
         act_set_api_key.triggered.connect(self._set_api_key_interactive)
+        act_set_cursor_key.triggered.connect(self._set_cursor_cloud_agent_key_interactive)
+        act_cursor_agent.triggered.connect(self._open_cursor_cloud_agent_dialog)
         act_toggle_memory.triggered.connect(self._toggle_memory_panel)
         act_toggle_idle.triggered.connect(lambda: self._set_idle_collapsed(not self._idle_collapsed))
         act_set_idle_timeout.triggered.connect(self._set_idle_timeout_interactive)
@@ -1697,6 +1844,8 @@ class DesktopPet(QWidget):
 
         menu.addAction(act_reset)
         menu.addAction(act_set_api_key)
+        menu.addAction(act_set_cursor_key)
+        menu.addAction(act_cursor_agent)
         menu.addAction(act_toggle_memory)
         menu.addAction(act_toggle_idle)
         menu.addAction(act_set_idle_timeout)
