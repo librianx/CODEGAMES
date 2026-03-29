@@ -3,7 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-Location "E:\CODEGAMES\VIVY"
+Set-Location $PSScriptRoot
 
 if (!(Test-Path ".venv")) {
   py -m venv .venv
