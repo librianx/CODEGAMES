@@ -502,8 +502,11 @@ class CreativeAvatarDock(QWidget):
         sh = self._label.sizeHint()
         lw = max(self._label.minimumWidth(), sh.width())
         lh = max(self._label.minimumHeight(), sh.height())
+        usable = max(1, self.height() - action_h - (8 if action_h else 0))
+        # 待机/窄窗时 sizeHint 可能大于 dock，不缩会画出父控件遭系统裁切
+        lw = min(lw, max(1, self.width()))
+        lh = min(lh, usable)
         x = max(0, (self.width() - lw) // 2)
-        usable = self.height() - action_h - (8 if action_h else 0)
         y = max(self._pad // 2, max(0, (usable - lh) // 2))
         self._label.setGeometry(x, y, lw, lh)
         if action_h:
@@ -544,7 +547,8 @@ class DesktopPet(QWidget):
         self._idle_timeout_s = int(os.getenv("VIVY_IDLE_TIMEOUT", "18"))
         self._expanded_size = QSize(556, 280)
         self._expanded_size_with_memory = QSize(720, 296)
-        self._collapsed_size = QSize(170, 170)
+        # 需 ≥ avatar_dock 内头像与边距；过小会裁切 GIF（原 170×170 低于 dock minHeight 198）
+        self._collapsed_size = QSize(220, 236)
 
         # bubble priority: prevent system/status messages from overwriting replies
         self._bubble_lock_until_ts = 0.0
@@ -1742,6 +1746,16 @@ class DesktopPet(QWidget):
         if collapsed:
             self.options_wrap.hide()
             self.memory_wrap.hide()
+            # 领域按钮占高一截，与待机小窗的 minHeight 冲突会导致头像被裁；待机时只保留立绘
+            self.creative_actions.hide()
+            self.avatar_dock.setMinimumHeight(96)
+            self.avatar_dock.setMaximumHeight(16777215)
+        else:
+            if self.chat_mode == "creative":
+                self.creative_actions.show()
+            else:
+                self.creative_actions.hide()
+            self._sync_avatar_dock_heights()
         self._apply_window_size()
 
     def _apply_window_size(self):
