@@ -9,14 +9,22 @@ from typing import TYPE_CHECKING
 
 import requests
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont, QKeySequence, QShortcut, QTextCursor
+from PyQt6.QtGui import (
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QFont,
+    QKeySequence,
+    QShortcut,
+    QTextCursor,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -46,6 +54,84 @@ IMMERSIVE_AUTOSAVE_PATH = PROJECT_DIR / ".vivy_immersive_autosave.md"
 IMMERSIVE_RECENT_FILE = PROJECT_DIR / ".immersive_recent.json"
 # 单块「支柱」在客户端预截断，为其它投喂与模型总预算留空间
 IMMERSIVE_PILLAR_SOFT_CAP = 6000
+REF_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
+
+
+def _ref_drop_local_paths(event: QDragEnterEvent | QDragMoveEvent | QDropEvent) -> list[str]:
+    md = event.mimeData()
+    if not md.hasUrls():
+        return []
+    out: list[str] = []
+    for url in md.urls():
+        if url.isLocalFile():
+            p = url.toLocalFile()
+            if Path(p).suffix.lower() in REF_DOC_SUFFIXES:
+                out.append(p)
+    return out
+
+
+class ImmersiveReferenceDropFrame(QFrame):
+    """创作参考区外框：空白处拖入文档即加入投喂列表。"""
+
+    def __init__(self, host: "ImmersiveWritingWindow"):
+        super().__init__()
+        self._host = host
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if _ref_drop_local_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        if _ref_drop_local_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        paths = _ref_drop_local_paths(event)
+        if not paths:
+            if event.mimeData().hasUrls():
+                self._host._pet._set_status_text("参考区仅支持拖入 .txt、.md、.docx、.pdf")
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        for p in paths:
+            self._host._ingest_reference_path(p)
+
+
+class ReferenceFileListWidget(QListWidget):
+    """列表区域也接收拖放，避免只有外框能拖."""
+
+    def __init__(self, host: "ImmersiveWritingWindow"):
+        super().__init__()
+        self._host = host
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if _ref_drop_local_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        if _ref_drop_local_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        paths = _ref_drop_local_paths(event)
+        if not paths:
+            if event.mimeData().hasUrls():
+                self._host._pet._set_status_text("参考区仅支持拖入 .txt、.md、.docx、.pdf")
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        for p in paths:
+            self._host._ingest_reference_path(p)
 
 
 def _immersive_load_recent(max_n: int = 10) -> list[str]:
@@ -158,6 +244,11 @@ class ImmersiveWritingWindow(QWidget):
                 left: 12px;
                 padding: 0 6px;
             }
+            QFrame#imRefDropZone {
+                border: 1px dashed rgba(100, 190, 240, 100);
+                border-radius: 10px;
+                background: rgba(6, 14, 22, 80);
+            }
             """
         )
 
@@ -237,9 +328,18 @@ class ImmersiveWritingWindow(QWidget):
         bar2.addStretch(1)
         root.addLayout(bar2)
 
-        pillar_box = QGroupBox("创作支柱：角色设定 · 世界观 · 大纲（可粘贴或载入文件，润色/续写时优先参考）")
-        pillar_box.setObjectName("imPillarBox")
-        pv = QVBoxLayout(pillar_box)
+        pillar_toggle_row = QHBoxLayout()
+        self.btn_toggle_pillars = mk_btn("展开创作支柱 ▼", self._toggle_pillar_panel)
+        self.btn_toggle_pillars.setToolTip("展开后编辑角色 / 世界观 / 大纲（默认折叠节省空间）")
+        pillar_toggle_row.addWidget(self.btn_toggle_pillars)
+        pillar_toggle_row.addStretch(1)
+        root.addLayout(pillar_toggle_row)
+
+        self.pillar_box = QGroupBox(
+            "创作支柱：角色设定 · 世界观 · 大纲（可粘贴或载入文件，润色/续写时优先参考）"
+        )
+        self.pillar_box.setObjectName("imPillarBox")
+        pv = QVBoxLayout(self.pillar_box)
         pv.setSpacing(6)
 
         self._setting_load_buttons = []
@@ -273,9 +373,12 @@ class ImmersiveWritingWindow(QWidget):
         ph_clear.addStretch(1)
         pv.addLayout(ph_clear)
 
-        root.addWidget(pillar_box)
+        self.pillar_box.setVisible(False)
+        root.addWidget(self.pillar_box)
 
-        self.lbl_feed_title = QLabel("文档投喂（设定 / 大纲 / 书摘等，辅助润色与续写）")
+        self.lbl_feed_title = QLabel(
+            "创作参考：可拖入 .txt / .md / .docx / .pdf 到下方区域，或使用按钮添加"
+        )
         self.lbl_feed_title.setObjectName("imBarLbl")
         self.lbl_feed_title.setStyleSheet("color: rgba(120, 220, 255, 255); font-weight: 600; font-size: 12px;")
         self.lbl_feed_title.setWordWrap(True)
@@ -298,19 +401,22 @@ class ImmersiveWritingWindow(QWidget):
         self.lbl_ref_status.setStyleSheet("color: rgba(160, 210, 235, 200);")
         ref_btns.addWidget(self.lbl_ref_status)
 
-        self.list_ref = QListWidget()
+        self.list_ref = ReferenceFileListWidget(self)
         self.list_ref.setMaximumHeight(80)
-        self.list_ref.setToolTip("已加入的参考文档；选中一行后点「移除所选」。")
+        self.list_ref.setToolTip(
+            "已加入的参考文档；可将文件拖放到此列表或整个参考区域。选中一行后点「移除所选」。"
+        )
 
         ref_col = QVBoxLayout()
         ref_col.setSpacing(4)
-        ref_col.setContentsMargins(0, 2, 0, 0)
+        ref_col.setContentsMargins(8, 8, 8, 8)
         ref_col.addWidget(self.lbl_feed_title)
         ref_col.addLayout(ref_btns)
         ref_col.addWidget(self.list_ref)
-        ref_wrap = QWidget()
-        ref_wrap.setLayout(ref_col)
-        root.addWidget(ref_wrap)
+        ref_zone = ImmersiveReferenceDropFrame(self)
+        ref_zone.setObjectName("imRefDropZone")
+        ref_zone.setLayout(ref_col)
+        root.addWidget(ref_zone)
 
         self.assist_wrap = QWidget()
         aw = QVBoxLayout(self.assist_wrap)
@@ -383,6 +489,13 @@ class ImmersiveWritingWindow(QWidget):
             b.setDisabled(busy)
         if hasattr(self, "btn_clear_pillars"):
             self.btn_clear_pillars.setDisabled(busy)
+        if hasattr(self, "btn_toggle_pillars"):
+            self.btn_toggle_pillars.setDisabled(busy)
+
+    def _toggle_pillar_panel(self) -> None:
+        vis = not self.pillar_box.isVisible()
+        self.pillar_box.setVisible(vis)
+        self.btn_toggle_pillars.setText("收起创作支柱 ▲" if vis else "展开创作支柱 ▼")
 
     def _load_setting_from_file(self, editor: QPlainTextEdit) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -455,14 +568,9 @@ class ImmersiveWritingWindow(QWidget):
                 f"参考文档：{len(self._reference_items)} 份 · 约 {total} 字（提交时可能再截断）"
             )
 
-    def _add_reference_document(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择参考文档（设定、大纲、年表等）",
-            str(PROJECT_DIR),
-            "Documents (*.txt *.md *.docx *.pdf);;All Files (*.*)",
-        )
-        if not path:
+    def _ingest_reference_path(self, path: str) -> None:
+        path = (path or "").strip()
+        if not path or Path(path).suffix.lower() not in REF_DOC_SUFFIXES:
             return
         try:
             doc = load_document_text(path, max_chars=OFFICE_REFERENCE_MAX_PER_DOC)
@@ -479,9 +587,18 @@ class ImmersiveWritingWindow(QWidget):
         if not replaced:
             self._reference_items.append({"path": doc.path, "name": name, "text": doc.text})
         self._rebuild_reference_list_widget()
-        self._pet._set_status_text(
-            f"已{'更新' if replaced else '添加'}参考文档：{name}"
+        self._pet._set_status_text(f"已{'更新' if replaced else '添加'}参考文档：{name}")
+
+    def _add_reference_document(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择参考文档（设定、大纲、年表等）",
+            str(PROJECT_DIR),
+            "Documents (*.txt *.md *.docx *.pdf);;All Files (*.*)",
         )
+        if not path:
+            return
+        self._ingest_reference_path(path)
 
     def _remove_selected_reference(self) -> None:
         row = self.list_ref.currentRow()
