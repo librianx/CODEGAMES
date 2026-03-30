@@ -4,7 +4,7 @@ import re
 import uuid
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 import json
 
@@ -818,6 +818,17 @@ def api_message():
         messages.append({"type": "chat", "text": "好！我来换一个问题，把你的偏好再对齐一下。"})
         messages.append(qmsg)
         _record_assistant_text(user_id, "好！我来换一个问题，把你的偏好再对齐一下。", chat_mode)
+        return _json_response({"user_id": user_id, "messages": messages})
+
+    # 2.5) 直接回答本地时间（避免模型瞎猜时区/DST 导致快一小时）
+    if ("几点" in message) or ("现在时间" in message) or (lower.strip() in ("时间", "几点了", "现在几点")):
+        now = datetime.now().astimezone()
+        timestr = now.strftime("%H:%M")
+        tz = now.strftime("%Z") or "本地"
+        reply = f"现在是 {timestr}（{tz}）。"
+        messages.append({"type": "chat", "text": reply})
+        _record_assistant_text(user_id, reply, chat_mode)
+        log_interaction(user_id, topic="时间查询", sentiment="neutral", content=message[:80])
         return _json_response({"user_id": user_id, "messages": messages})
 
     # 3) 触发灵感分享
