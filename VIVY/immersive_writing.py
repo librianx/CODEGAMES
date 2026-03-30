@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QGroupBox,
     QSplitter,
     QSpinBox,
     QTextEdit,
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
 PROJECT_DIR = Path(__file__).resolve().parent
 IMMERSIVE_AUTOSAVE_PATH = PROJECT_DIR / ".vivy_immersive_autosave.md"
 IMMERSIVE_RECENT_FILE = PROJECT_DIR / ".immersive_recent.json"
+# 单块「支柱」在客户端预截断，为其它投喂与模型总预算留空间
+IMMERSIVE_PILLAR_SOFT_CAP = 6000
 
 
 def _immersive_load_recent(max_n: int = 10) -> list[str]:
@@ -99,7 +102,7 @@ class ImmersiveWritingWindow(QWidget):
 
         self.setWindowTitle("VIVY 沉浸写作")
         self.setMinimumSize(640, 420)
-        self.resize(960, 680)
+        self.resize(960, 780)
         self.setStyleSheet(
             """
             ImmersiveWritingWindow {
@@ -133,6 +136,28 @@ class ImmersiveWritingWindow(QWidget):
             QPushButton#imBarBtn:hover { background: rgba(48, 150, 200, 220); }
             QPushButton#imBarBtn:disabled { background: rgba(40, 60, 80, 150); color: #8899aa; }
             QLabel#imBarLbl { color: #9ecfe8; font-size: 12px; }
+            QPlainTextEdit#imSettingNote {
+                background: #0a1218;
+                color: #d0e8ff;
+                border: 1px solid rgba(90, 180, 230, 90);
+                border-radius: 8px;
+                padding: 8px 10px;
+                font-size: 12px;
+                selection-background-color: rgba(55, 214, 255, 100);
+            }
+            QGroupBox#imPillarBox {
+                color: rgba(170, 230, 255, 250);
+                font-weight: 600;
+                border: 1px solid rgba(80, 160, 210, 130);
+                border-radius: 10px;
+                margin-top: 10px;
+                padding-top: 14px;
+            }
+            QGroupBox#imPillarBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+            }
             """
         )
 
@@ -212,6 +237,44 @@ class ImmersiveWritingWindow(QWidget):
         bar2.addStretch(1)
         root.addLayout(bar2)
 
+        pillar_box = QGroupBox("创作支柱：角色设定 · 世界观 · 大纲（可粘贴或载入文件，润色/续写时优先参考）")
+        pillar_box.setObjectName("imPillarBox")
+        pv = QVBoxLayout(pillar_box)
+        pv.setSpacing(6)
+
+        self._setting_load_buttons = []
+        self.edit_character = QPlainTextEdit()
+        self.edit_world = QPlainTextEdit()
+        self.edit_outline = QPlainTextEdit()
+        specs = [
+            ("角色设定", "主要人物性格、动机、关系、声口、禁忌等…", self.edit_character),
+            ("世界观设定", "时代、地理、规则、势力、历史与未解之谜等…", self.edit_world),
+            ("创作大纲", "卷/章结构、主线、伏笔、待写节点与结局走向等…", self.edit_outline),
+        ]
+        for title, ph, ed in specs:
+            ed.setObjectName("imSettingNote")
+            ed.setPlaceholderText(ph)
+            ed.setMinimumHeight(64)
+            ed.setMaximumHeight(96)
+            hl = QHBoxLayout()
+            tl = QLabel(title)
+            tl.setObjectName("imBarLbl")
+            hl.addWidget(tl)
+            hl.addStretch(1)
+            lb = mk_btn("载入文件", lambda e=ed: self._load_setting_from_file(e))
+            self._setting_load_buttons.append(lb)
+            hl.addWidget(lb)
+            pv.addLayout(hl)
+            pv.addWidget(ed)
+
+        ph_clear = QHBoxLayout()
+        self.btn_clear_pillars = mk_btn("清空三项支柱", self._clear_pillar_fields)
+        ph_clear.addWidget(self.btn_clear_pillars)
+        ph_clear.addStretch(1)
+        pv.addLayout(ph_clear)
+
+        root.addWidget(pillar_box)
+
         self.lbl_feed_title = QLabel("文档投喂（设定 / 大纲 / 书摘等，辅助润色与续写）")
         self.lbl_feed_title.setObjectName("imBarLbl")
         self.lbl_feed_title.setStyleSheet("color: rgba(120, 220, 255, 255); font-weight: 600; font-size: 12px;")
@@ -259,7 +322,7 @@ class ImmersiveWritingWindow(QWidget):
         self.editor.setPlaceholderText(
             "在此专注写作…\n"
             "快捷键：Ctrl+S / O / N / F，F11 全屏，Esc 退出全屏。\n"
-            "可先点上方「添加投喂文档」加入参考；选中一段再点润色等，未选则对全文。"
+            "可在上方填写「角色 / 世界 / 大纲」或添加投喂文档；选中一段再点润色等，未选则对全文。"
         )
         self.editor.textChanged.connect(self._on_text_changed)
         ef = QFont(self.editor.font())
@@ -316,6 +379,64 @@ class ImmersiveWritingWindow(QWidget):
             b.setDisabled(busy)
         for b in (self.btn_ref_add, self.btn_ref_remove, self.btn_ref_clear):
             b.setDisabled(busy)
+        for b in getattr(self, "_setting_load_buttons", []):
+            b.setDisabled(busy)
+        if hasattr(self, "btn_clear_pillars"):
+            self.btn_clear_pillars.setDisabled(busy)
+
+    def _load_setting_from_file(self, editor: QPlainTextEdit) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "载入到当前编辑框",
+            str(PROJECT_DIR),
+            "Documents (*.txt *.md *.docx *.pdf);;All Files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            doc = load_document_text(path, max_chars=OFFICE_REFERENCE_MAX_PER_DOC)
+        except Exception as e:
+            QMessageBox.warning(self, "沉浸写作", f"无法读取：{e}")
+            return
+        editor.setPlainText(doc.text)
+        self._pet._set_status_text(f"已载入：{Path(doc.path).name}")
+
+    def _clear_pillar_fields(self) -> None:
+        if not any(
+            (w.toPlainText() or "").strip()
+            for w in (self.edit_character, self.edit_world, self.edit_outline)
+        ):
+            return
+        r = QMessageBox.question(
+            self,
+            "沉浸写作",
+            "确定清空「角色设定 / 世界观 / 创作大纲」三项内容吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self.edit_character.clear()
+        self.edit_world.clear()
+        self.edit_outline.clear()
+
+    def _build_reference_docs_payload(self) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
+        pairs = (
+            ("角色设定", self.edit_character),
+            ("世界观设定", self.edit_world),
+            ("创作大纲", self.edit_outline),
+        )
+        for label, w in pairs:
+            t = (w.toPlainText() or "").strip()
+            if not t:
+                continue
+            if len(t) > IMMERSIVE_PILLAR_SOFT_CAP:
+                t = t[: IMMERSIVE_PILLAR_SOFT_CAP] + "\n…（本地已截断）"
+            out.append({"label": label, "text": t})
+        for x in self._reference_items:
+            out.append({"label": x["name"], "text": x["text"]})
+        return out
 
     def _rebuild_reference_list_widget(self) -> None:
         self.list_ref.clear()
@@ -643,10 +764,7 @@ class ImmersiveWritingWindow(QWidget):
 
         def _request_stream():
             url = f"{pet.api_base}/api/office_passage_stream"
-            ref_docs = [
-                {"label": x["name"], "text": x["text"]}
-                for x in self._reference_items
-            ]
+            ref_docs = self._build_reference_docs_payload()
             payload = {
                 "user_id": pet.user_id,
                 "passage": passage,

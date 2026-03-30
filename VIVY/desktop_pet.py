@@ -988,6 +988,7 @@ class DesktopPet(QWidget):
 
     def _run_async(self, fn, on_success, on_error, on_progress=None, thinking_text: str | None = "VIVY 思考中..."):
         if self._busy:
+            self._set_status_text("当前仍在处理上一请求（例如正在回复或云 Agent），请稍候再试。")
             return
         self._touch()
         self._set_busy(True, thinking_text=thinking_text)
@@ -1290,6 +1291,9 @@ class DesktopPet(QWidget):
 
     def _refresh_memory(self, silent: bool = True):
         self._touch()
+        if not silent:
+            self._set_status_text("正在读取记忆…")
+
         def _request():
             return self._request_get_json(f"/api/memory?user_id={self.user_id}")
 
@@ -1319,14 +1323,13 @@ class DesktopPet(QWidget):
             if not silent:
                 self._set_status_text(f"读取记忆失败：{error_msg}")
 
-        if silent:
-            # silent refresh should never disable the UI
-            self._run_background(_request, on_success=_ok, on_error=_err)
-        else:
-            self._run_async(_request, _ok, _err, thinking_text="正在读取记忆...")
+        # 与主对话共用 busy 会令「刷新/保存」在思考或流式输出时被 _run_async 直接吞掉；记忆走后台线程即可
+        self._run_background(_request, on_success=_ok, on_error=_err)
 
     def _save_memory(self):
         self._touch()
+        self._set_status_text("正在保存记忆…")
+
         def _request():
             import json
             prefs = json.loads((self.memory_prefs.toPlainText() or "{}").strip() or "{}")
@@ -1344,7 +1347,7 @@ class DesktopPet(QWidget):
         def _err(error_msg):
             self._set_status_text(f"保存记忆失败：{error_msg}")
 
-        self._run_async(_request, _ok, _err, thinking_text="正在保存记忆...")
+        self._run_background(_request, on_success=_ok, on_error=_err)
 
     def _show_memory_guide(self):
         self._touch()
@@ -1406,7 +1409,8 @@ class DesktopPet(QWidget):
         def _err(error_msg):
             self._set_status_text(f"删除失败：{error_msg}")
 
-        self._run_async(_request, _ok, _err, thinking_text="正在删除回合...")
+        self._set_status_text("正在删除回合…")
+        self._run_background(_request, on_success=_ok, on_error=_err)
 
     def _set_api_key_interactive(self):
         self._touch()
@@ -2065,7 +2069,14 @@ class DesktopPet(QWidget):
 def run_flask_background(port: int):
     def _target():
         init_db()
-        flask_app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+        # threaded=True：避免单请求（如长时间流式 chat）独占本机服务，导致记忆 API 无法响应
+        flask_app.run(
+            host="127.0.0.1",
+            port=port,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        )
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()

@@ -128,11 +128,19 @@ def build_office_passage_prompt(
         ref_chunks = []
         for label, body in ref_list:
             ref_chunks.append(f"【参考文档：{label}】\n{body}")
-        parts.append(
-            "下列【参考文档】由用户主动投喂，与本次写作相关。辅助时请结合其中设定、事实与风格；"
-            "不要编造与参考明显矛盾的内容；若与当前选区无关可少引用。\n\n"
-            + "\n\n---\n\n".join(ref_chunks)
-        )
+        pillar_names = frozenset({"角色设定", "世界观设定", "创作大纲"})
+        has_pillar = any(str(lab).strip() in pillar_names for lab, _ in ref_list)
+        if has_pillar:
+            ref_intro = (
+                "下列资料包含用户整理的【创作支柱】（角色设定 / 世界观设定 / 创作大纲）以及其它参考文档。"
+                "辅助时请优先与支柱中的设定、规则与剧情规划保持一致，避免无依据矛盾；其它参考按需取用，勿大段复述。\n\n"
+            )
+        else:
+            ref_intro = (
+                "下列【参考文档】由用户主动投喂，与本次写作相关。辅助时请结合其中设定、事实与风格；"
+                "不要编造与参考明显矛盾的内容；若与当前选区无关可少引用。\n\n"
+            )
+        parts.append(ref_intro + "\n\n---\n\n".join(ref_chunks))
     if ctx:
         parts.append(
             "【附近上下文（仅供参考，勿大段复述）】\n"
