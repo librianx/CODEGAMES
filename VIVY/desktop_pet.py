@@ -27,7 +27,7 @@ from PyQt6.QtCore import (
     pyqtProperty,
     QEvent,
 )
-from PyQt6.QtGui import QAction, QMouseEvent, QMovie, QImageReader
+from PyQt6.QtGui import QAction, QMouseEvent, QMoveEvent, QMovie, QImageReader
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PyQt6.QtGui import (
@@ -71,6 +71,7 @@ from cursor_agent_api import (
     launch_agent,
     wait_agent_terminal,
 )
+from command_effect import CommandEffect
 
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
@@ -677,6 +678,11 @@ class DesktopPet(QWidget):
         self.avatar_dock.setMaximumWidth(160 + 48)
         self._sync_avatar_dock_heights()
 
+        self._command_effect = CommandEffect(None, target_text="创作模式")
+        self._command_effect_w = int(os.getenv("VIVY_COMMAND_FX_W", "220"))
+        self._command_effect_h = int(os.getenv("VIVY_COMMAND_FX_H", "44"))
+        self._command_effect_margin_top = int(os.getenv("VIVY_COMMAND_FX_MARGIN_TOP", "4"))
+
         # quick actions
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
@@ -940,6 +946,11 @@ class DesktopPet(QWidget):
                 target_w = min(260, max(220, self.image_label.width()))
                 target_h = int(target_w * (src_size.height() / src_size.width()))
                 self.movie.setScaledSize(src_size.scaled(target_w, target_h, Qt.AspectRatioMode.KeepAspectRatio))
+        self._reposition_command_effect()
+
+    def moveEvent(self, event: QMoveEvent):
+        super().moveEvent(event)
+        self._reposition_command_effect()
 
     def _load_or_create_user_id(self) -> str:
         if USER_ID_FILE.exists():
@@ -1187,6 +1198,39 @@ class DesktopPet(QWidget):
         self.avatar_dock.setMaximumHeight(248 + extra)
         self._apply_window_size()
 
+    def _stop_command_effect(self):
+        ce = getattr(self, "_command_effect", None)
+        if ce is not None:
+            ce.stop_effect()
+
+    def _place_command_effect(self):
+        ce = getattr(self, "_command_effect", None)
+        if ce is None:
+            return
+        # 锚在立绘控件头顶正中（非整列 avatar_dock，避免跟底部领域按钮对齐）
+        anchor = self.image_label
+        w, h = self._command_effect_w, self._command_effect_h
+        dx = max(0, (anchor.width() - w) // 2)
+        dy = -h - max(0, self._command_effect_margin_top)
+        ce.follow_master(anchor, dx, dy, w, h)
+
+    def _reposition_command_effect(self):
+        ce = getattr(self, "_command_effect", None)
+        if ce is None or not ce.isVisible():
+            return
+        if self.chat_mode != "creative" or self._idle_collapsed:
+            return
+        self._place_command_effect()
+
+    def _start_command_effect_if_needed(self):
+        if self.chat_mode != "creative" or self._idle_collapsed:
+            return
+        ce = getattr(self, "_command_effect", None)
+        if ce is None:
+            return
+        self._place_command_effect()
+        ce.start_effect()
+
     def _on_creative_domain_intro_finished(self):
         if self.chat_mode != "creative":
             return
@@ -1197,6 +1241,7 @@ class DesktopPet(QWidget):
                 eff = b.graphicsEffect()
                 if isinstance(eff, QGraphicsOpacityEffect):
                     eff.setOpacity(1.0)
+            QTimer.singleShot(0, self._start_command_effect_if_needed)
             return
         for i, b in enumerate(self._creative_domain_buttons):
             eff = b.graphicsEffect()
@@ -1208,6 +1253,7 @@ class DesktopPet(QWidget):
             anim.setEndValue(1.0)
             anim.setEasingCurve(QEasingCurve.Type.OutBack)
             QTimer.singleShot(50 + i * 95, anim.start)
+        QTimer.singleShot(0, self._start_command_effect_if_needed)
 
     def _finish_hide_creative_actions(self):
         if self.chat_mode != "creative":
@@ -1257,6 +1303,7 @@ class DesktopPet(QWidget):
         else:
             self.btn_mode.setText("形态：普通")
             self.controls_wrap.setStyleSheet("")
+            self._stop_command_effect()
             self._hide_creative_domain_buttons(animated=mode_changed)
             self.domain_aura.set_creative_active(False, animate=mode_changed)
             if mode_changed:
@@ -1748,6 +1795,7 @@ class DesktopPet(QWidget):
             self.memory_wrap.hide()
             # 领域按钮占高一截，与待机小窗的 minHeight 冲突会导致头像被裁；待机时只保留立绘
             self.creative_actions.hide()
+            self._stop_command_effect()
             self.avatar_dock.setMinimumHeight(96)
             self.avatar_dock.setMaximumHeight(16777215)
         else:
@@ -1756,6 +1804,7 @@ class DesktopPet(QWidget):
             else:
                 self.creative_actions.hide()
             self._sync_avatar_dock_heights()
+            QTimer.singleShot(60, self._start_command_effect_if_needed)
         self._apply_window_size()
 
     def _apply_window_size(self):
@@ -1785,6 +1834,11 @@ class DesktopPet(QWidget):
 
     def eventFilter(self, obj, event):
         try:
+            if (
+                obj in (self.avatar_dock, self.image_label)
+                and event.type() == QEvent.Type.Resize
+            ):
+                QTimer.singleShot(0, self._reposition_command_effect)
             if event.type() == QEvent.Type.MouseButtonDblClick:
                 if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
                     if obj in (self.image_label, self.domain_aura, self.avatar_dock):
