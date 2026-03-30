@@ -6,8 +6,8 @@ import random
 import string
 from typing import Optional
 
-from PyQt6.QtCore import QPoint, Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QPainter, QPen
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PyQt6.QtWidgets import (
     QGraphicsDropShadowEffect,
     QLabel,
@@ -52,10 +52,11 @@ class CommandEffect(QWidget):
         "的一是在不了有和人这中大为上个国我以要地出就分对成会可主发年动"
         "同业工能干过子说产种面而方后多定行学法所民得经十三之进着等部"
     )
-    # 深蓝点阵字 / 暗终端描边
+    # 深蓝点阵字；外框为灰白色塑料壳（实际绘制在 paintEvent）
     _TEXT_BLUE = "#4d8ccb"
-    _BORDER_BLUE = "#2e4d73"
-    _BG_TERMINAL = "rgba(6, 7, 10, 248)"
+    _BEZEL_PX = 5
+    _BEZEL_HI = (236, 239, 244)  # 高光（上/左）
+    _BEZEL_LO = (132, 138, 150)  # 阴影（下/右）
 
     @staticmethod
     def _make_pixel_font() -> QFont:
@@ -95,8 +96,8 @@ class CommandEffect(QWidget):
 
         self._label = QLabel(self)
         self._label.setObjectName("commandEffectLabel")
-        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._label.setWordWrap(False)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self._label.setWordWrap(True)
         self._label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         self._label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum)
 
@@ -107,8 +108,8 @@ class CommandEffect(QWidget):
         self._label.setFont(self._make_pixel_font())
 
         glow = QGraphicsDropShadowEffect(self)
-        glow.setBlurRadius(10)
-        glow.setColor(QColor(35, 75, 130, 38))
+        glow.setBlurRadius(14)
+        glow.setColor(QColor(210, 215, 225, 70))
         glow.setOffset(0, 0)
         self.setGraphicsEffect(glow)
 
@@ -119,9 +120,30 @@ class CommandEffect(QWidget):
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # 顶层透明窗下，Qt 可能不绘制 QWidget 样式表背景/边框；强制启用样式背景更稳
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
         self._apply_style()
+
+    def paintEvent(self, event):
+        # 顶层透明窗 + 样式表可能不生效：自绘厚塑料边框 + 内屏黑底
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        W, H = self.width(), self.height()
+        fw = self._BEZEL_PX
+        if W < fw * 2 + 4 or H < fw * 2 + 4:
+            fw = max(2, min(W, H) // 5)
+        hi = QColor(*self._BEZEL_HI, 255)
+        lo = QColor(*self._BEZEL_LO, 255)
+        # 上亮下暗的塑料壳
+        p.fillRect(0, 0, W, fw, hi)
+        p.fillRect(0, 0, fw, H, hi)
+        p.fillRect(0, H - fw, W, fw, lo)
+        p.fillRect(W - fw, 0, fw, H, lo)
+        inner_bg = QColor(6, 7, 10, 248)
+        p.fillRect(fw, fw, W - 2 * fw, H - 2 * fw, inner_bg)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -138,14 +160,11 @@ class CommandEffect(QWidget):
 
     def _apply_style(self) -> None:
         t = self._TEXT_BLUE
-        b = self._BORDER_BLUE
-        bg = self._BG_TERMINAL
         self.setStyleSheet(
             f"""
             CommandEffect {{
-                background-color: {bg};
-                border: 1px solid {b};
-                border-radius: 2px;
+                background-color: transparent;
+                border: none;
             }}
             QLabel#commandEffectLabel {{
                 color: {t};
@@ -199,6 +218,32 @@ class CommandEffect(QWidget):
 
     def set_effect_size(self, w: int, h: int) -> None:
         self.setFixedSize(w, h)
+
+    def fit_to_text(
+        self,
+        max_text_width: int = 400,
+        max_outer_height: int = 140,
+        min_outer_width: int = 168,
+    ) -> tuple[int, int]:
+        """按目标文案折行估算外壳尺寸（用于长句不全截断）。"""
+        lay = self.layout()
+        ml, mt, mr, mb = 10, 7, 10, 7
+        if lay is not None:
+            m = lay.contentsMargins()
+            ml, mt, mr, mb = m.left(), m.top(), m.right(), m.bottom()
+        fw = self._BEZEL_PX
+        cap = max(80, int(max_text_width))
+        inner_w = max(48, cap - ml - mr - 2 * fw)
+        txt = (self._target or "").strip() or " "
+        fm = QFontMetrics(self._label.font())
+        flags = Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap
+        br = fm.boundingRect(QRect(0, 0, inner_w, 50_000), int(flags), txt)
+        outer_w = max(min_outer_width, min(cap, inner_w + ml + mr + 2 * fw + 2))
+        line_h = max(fm.height(), 12)
+        need_h = br.height() + mt + mb + 2 * fw + 6
+        outer_h = max(line_h + mt + mb + 2 * fw, min(int(max_outer_height), need_h))
+        self.set_effect_size(outer_w, outer_h)
+        return outer_w, outer_h
 
     def set_offset_from_master(self, master: QWidget, dx: int, dy: int) -> None:
         top_left = master.mapToGlobal(QPoint(0, 0))

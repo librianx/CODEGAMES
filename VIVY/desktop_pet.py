@@ -72,6 +72,7 @@ from cursor_agent_api import (
     wait_agent_terminal,
 )
 from command_effect import CommandEffect
+from urban_inspiration import UrbanInspirationPanel, generate_inspiration_short
 
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
@@ -603,6 +604,15 @@ class DesktopPet(QWidget):
 
         self.controls_layout.addWidget(self.bubble)
 
+        self._urban_inspiration_panel = UrbanInspirationPanel(
+            self.controls_wrap,
+            interval_ms=int(os.getenv("VIVY_INSPIRATION_INTERVAL_MS", "30000")),
+        )
+        self._urban_inspiration_panel.hide()
+        self._urban_inspiration_space_added = False
+        self._urban_inspiration_extra_h = int(os.getenv("VIVY_INSPIRATION_PANEL_H", "58"))
+        self.controls_layout.addWidget(self._urban_inspiration_panel)
+
         self.options_wrap = QFrame()
         self.options_layout = QVBoxLayout(self.options_wrap)
         self.options_layout.setContentsMargins(0, 0, 0, 0)
@@ -681,14 +691,21 @@ class DesktopPet(QWidget):
         self._command_effect = CommandEffect(None, target_text="创作模式")
         self._command_effect_w = int(os.getenv("VIVY_COMMAND_FX_W", "220"))
         self._command_effect_h = int(os.getenv("VIVY_COMMAND_FX_H", "44"))
-        self._command_effect_margin_top = int(os.getenv("VIVY_COMMAND_FX_MARGIN_TOP", "4"))
+        self._command_effect_margin_top = int(os.getenv("VIVY_COMMAND_FX_MARGIN_TOP", "14"))
+
+        # 「今日灵感」用同款逐字落屏条（独立于创作模式）
+        self._inspiration_effect = CommandEffect(None, target_text="")
+        self._inspiration_effect_w = int(os.getenv("VIVY_INSP_FX_W", "260"))
+        self._inspiration_effect_h = int(os.getenv("VIVY_INSP_FX_H", "44"))
+        self._inspiration_effect_margin_top = int(os.getenv("VIVY_INSP_FX_MARGIN_TOP", "14"))
 
         # quick actions
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
 
         self.btn_inspiration = QPushButton("今日灵感")
-        self.btn_inspiration.clicked.connect(lambda: self._send_message("今天有什么灵感？"))
+        self.btn_inspiration.setToolTip("本地随机「都市指令」式碎片灵感；可每 30 秒自动刷新（可环境变量调整）")
+        self.btn_inspiration.clicked.connect(self._on_today_inspiration)
         action_row.addWidget(self.btn_inspiration)
 
         self.btn_improv_sketch = QPushButton("脑洞短剧")
@@ -1033,6 +1050,105 @@ class DesktopPet(QWidget):
         self._set_busy(False)
         callback(error_msg)
 
+    def _on_today_inspiration(self):
+        """都市指令式本地随机灵感；首次展开垫高窗口，并启动可选定时刷新。"""
+        self._touch()
+        panel = self._urban_inspiration_panel
+        if not panel.isVisible():
+            panel.show()
+            if not self._urban_inspiration_space_added:
+                self._urban_inspiration_space_added = True
+                dh = self._urban_inspiration_extra_h
+                self._expanded_size = QSize(
+                    self._expanded_size.width(),
+                    self._expanded_size.height() + dh,
+                )
+                self._expanded_size_with_memory = QSize(
+                    self._expanded_size_with_memory.width(),
+                    self._expanded_size_with_memory.height() + dh,
+                )
+                self._apply_window_size()
+        panel.manual_refresh()
+        panel.set_auto_refresh(True)
+
+        # 句子展现形式：像「创作模式」一样先乱码后逐字落屏
+        txt = generate_inspiration_short(max_chars=int(os.getenv("VIVY_INSP_MAX_CHARS", "48")))
+        self._inspiration_effect.set_target_text(txt)
+        self._inspiration_effect.fit_to_text(
+            max_text_width=int(os.getenv("VIVY_FX_MAX_TEXT_W", "420")),
+            max_outer_height=int(os.getenv("VIVY_FX_MAX_OUTER_H", "132")),
+            min_outer_width=int(os.getenv("VIVY_INSP_FX_MIN_W", "200")),
+        )
+        self._place_inspiration_effect()
+        self._inspiration_effect.start_effect()
+
+        # 可选：用云 Agent 联网扩写（更有创作元素）。本地先落屏，Agent 返回后再落屏一次覆盖。
+        use_agent = (os.getenv("VIVY_INSP_USE_AGENT") or "1").strip() not in ("0", "false", "False")
+        api_key = (os.getenv("CURSOR_API_KEY") or "").strip()
+        repo_s = (os.getenv("CURSOR_AGENT_REPO") or "").strip()
+        ref_s = (os.getenv("CURSOR_AGENT_REF") or "").strip()
+        if not use_agent or not api_key or not repo_s:
+            return
+
+        seed = txt
+
+        def _request():
+            prompt = (
+                "你是写作灵感生成器。请联网检索/联想与提示相关的意象、场景细节、微冲突。\n"
+                "要求：只输出 1 行中文灵感句子（不超过 48 字），可带 1 个具体物件 + 1 个场景 + 1 个冲突钩子。\n"
+                "不要解释、不要列表、不要引用来源、不要冒号开头。\n\n"
+                f"提示种子：{seed}\n"
+            )
+            created = launch_agent(
+                api_key,
+                prompt_text=prompt,
+                repository=repo_s,
+                ref=ref_s or None,
+            )
+            aid = str(created.get("id") or "").strip()
+            if not aid:
+                raise RuntimeError(f"启动响应缺少 id：{created!r}")
+            wait_agent_terminal(api_key, aid, max_wait_seconds=240.0, poll_seconds=3.0)
+            conv = get_conversation(api_key, aid)
+            msgs = conv.get("messages") or []
+            best = ""
+            if isinstance(msgs, list):
+                for m in reversed(msgs):
+                    if not isinstance(m, dict):
+                        continue
+                    if str(m.get("type") or "") != "assistant_message":
+                        continue
+                    best = str(m.get("text") or "").strip()
+                    if best:
+                        break
+            if not best:
+                best = format_conversation_text(conv, max_chars=400).strip()
+            # 取第一行作为落屏文本
+            line = (best.splitlines()[0] if best else "").strip()
+            return {"line": line}
+
+        def _ok(data):
+            line = str((data or {}).get("line") or "").strip()
+            if not line:
+                return
+            max_chars = int(os.getenv("VIVY_INSP_MAX_CHARS", "48"))
+            if len(line) > max_chars:
+                line = line[:max_chars].rstrip("，,;；:：") + "…"
+            self._inspiration_effect.set_target_text(line)
+            self._inspiration_effect.fit_to_text(
+                max_text_width=int(os.getenv("VIVY_FX_MAX_TEXT_W", "420")),
+                max_outer_height=int(os.getenv("VIVY_FX_MAX_OUTER_H", "132")),
+                min_outer_width=int(os.getenv("VIVY_INSP_FX_MIN_W", "200")),
+            )
+            self._place_inspiration_effect()
+            self._inspiration_effect.start_effect()
+
+        def _err(msg):
+            # 静默失败：不打断本地灵感
+            _ = msg
+
+        self._run_background(_request, on_success=_ok, on_error=_err)
+
     def _copy_latest_reply(self):
         text = self.bubble_text.textCursor().selectedText().strip() or self.latest_reply
         if text:
@@ -1203,6 +1319,11 @@ class DesktopPet(QWidget):
         if ce is not None:
             ce.stop_effect()
 
+    def _stop_inspiration_effect(self):
+        insp = getattr(self, "_inspiration_effect", None)
+        if insp is not None:
+            insp.stop_effect()
+
     def _place_command_effect(self):
         ce = getattr(self, "_command_effect", None)
         if ce is None:
@@ -1214,13 +1335,37 @@ class DesktopPet(QWidget):
         dy = -h - max(0, self._command_effect_margin_top)
         ce.follow_master(anchor, dx, dy, w, h)
 
-    def _reposition_command_effect(self):
+    def _place_inspiration_effect(self):
+        insp = getattr(self, "_inspiration_effect", None)
+        if insp is None:
+            return
+        anchor = self.image_label
+        w, h = insp.width(), insp.height()
+        if w <= 0 or h <= 0:
+            w, h = self._inspiration_effect_w, self._inspiration_effect_h
+        dx = max(0, (anchor.width() - w) // 2)
+        gap = int(os.getenv("VIVY_FX_STACK_GAP", "8"))
         ce = getattr(self, "_command_effect", None)
-        if ce is None or not ce.isVisible():
+        if ce is not None and ce.isVisible() and self.chat_mode == "creative":
+            # 创作条贴头顶；灵感条叠在创作条上方（更负的 y），禁止再用正 stack 把条压进立绘
+            hc = ce.height()
+            mc = max(0, self._command_effect_margin_top)
+            dy = -(hc + mc + gap + h)
+        else:
+            dy = -h - max(0, self._inspiration_effect_margin_top)
+        insp.follow_master(anchor, dx, dy, w, h)
+
+    def _reposition_command_effect(self):
+        if self._idle_collapsed:
             return
-        if self.chat_mode != "creative" or self._idle_collapsed:
-            return
-        self._place_command_effect()
+
+        ce = getattr(self, "_command_effect", None)
+        if ce is not None and ce.isVisible() and self.chat_mode == "creative":
+            self._place_command_effect()
+
+        insp = getattr(self, "_inspiration_effect", None)
+        if insp is not None and insp.isVisible():
+            self._place_inspiration_effect()
 
     def _start_command_effect_if_needed(self):
         if self.chat_mode != "creative" or self._idle_collapsed:
@@ -1796,6 +1941,7 @@ class DesktopPet(QWidget):
             # 领域按钮占高一截，与待机小窗的 minHeight 冲突会导致头像被裁；待机时只保留立绘
             self.creative_actions.hide()
             self._stop_command_effect()
+            self._stop_inspiration_effect()
             self.avatar_dock.setMinimumHeight(96)
             self.avatar_dock.setMaximumHeight(16777215)
         else:
