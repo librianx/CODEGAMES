@@ -1835,6 +1835,20 @@ class DesktopPet(QWidget):
 
     def _send_message(self, text: str):
         self._touch()
+        # 本地直答“现在几点”：避免后端/模型时区导致快一小时
+        t = (text or "").strip()
+        if t and (("几点" in t) or ("现在时间" in t) or (t in ("时间", "几点了", "现在几点"))):
+            try:
+                from datetime import datetime
+
+                now = datetime.now().astimezone()
+                timestr = now.strftime("%H:%M")
+                tz = now.strftime("%Z") or "本地"
+                self._hide_options()
+                self._set_bubble_text(f"现在是 {timestr}（{tz}）。", kind="reply")
+                return
+            except Exception:
+                pass
         # Commands that require structured messages should use non-stream endpoint.
         lower = (text or "").lower()
         is_structured = ("换个问题" in text) or ("了解我" in text) or ("灵感" in text) or ("冲浪" in lower)
