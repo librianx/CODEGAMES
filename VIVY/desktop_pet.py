@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import uuid
@@ -25,9 +26,17 @@ from PyQt6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
     pyqtProperty,
-    QEvent,
 )
-from PyQt6.QtGui import QAction, QMouseEvent, QMoveEvent, QMovie, QImageReader
+from PyQt6.QtGui import (
+    QAction,
+    QFont,
+    QKeySequence,
+    QMouseEvent,
+    QMovie,
+    QImageReader,
+    QShortcut,
+    QTextCursor,
+)
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PyQt6.QtGui import (
@@ -58,29 +67,56 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGraphicsOpacityEffect,
+    QPlainTextEdit,
+    QSplitter,
+    QSpinBox,
 )
 
 # Import existing Flask backend
 from app import app as flask_app
 from db import init_db
-from creative_assist import load_document_text
-from immersive_writing import ImmersiveWritingWindow
-from cursor_agent_api import (
-    format_conversation_text,
-    get_conversation,
-    launch_agent,
-    wait_agent_terminal,
-)
-from command_effect import CommandEffect
-from urban_inspiration import UrbanInspirationPanel, generate_inspiration_short
+from creative_assist import OFFICE_CONTEXT_MAX, OFFICE_PASSAGE_MAX, load_document_text
+from speech import recognize_once, speak_text_async
+
+try:
+    from cursor_agent_api import (
+        format_conversation_text,
+        get_conversation,
+        launch_agent,
+        wait_agent_terminal,
+    )
+except Exception:
+    format_conversation_text = None
+    get_conversation = None
+    launch_agent = None
+    wait_agent_terminal = None
+
+try:
+    from command_effect_stable import CommandEffect
+except Exception:
+    CommandEffect = None
+
+try:
+    from urban_inspiration import UrbanInspirationPanel, generate_inspiration_short, generate_inspiration
+except Exception:
+    UrbanInspirationPanel = None
+    generate_inspiration_short = None
+    generate_inspiration = None
+
 
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
-# 快捷按钮「脑洞短剧」发送的固定指令
 IMPROV_SKETCH_MESSAGE = (
     "即兴写一个脑洞小短剧：共 3～8 行，格式为「场景一句」与「角色名：台词」交替；"
     "要有一个无厘头误会，结尾用一句反转或金句收束；不要写作课讲解，不要正式标题以外的套话。"
 )
+
+_FALLBACK_INSPIRATION_POOL = [
+    "地铁玻璃里映出两个人影，其中一个比真人慢了半拍。",
+    "深夜便利店的自动门每隔十分钟自己开一次，但监控里门外没有人。",
+    "一封写给三天后的短信准时送达，而发件箱里并没有发送记录。",
+    "雨停后，天桥上出现一串没有尽头的湿脚印，方向却是通往天空。",
+]
 
 PROJECT_DIR = Path(__file__).resolve().parent
 USER_ID_FILE = PROJECT_DIR / ".desktop_user_id"
@@ -88,12 +124,66 @@ GIF_PATH = PROJECT_DIR / "static" / "images" / "VIVYfirst.gif"
 PNG_FALLBACK_PATH = PROJECT_DIR / "static" / "images" / "VIVYstatr.png"
 ENV_FILE = PROJECT_DIR / ".env"
 DOMAIN_SOUND_PATH = PROJECT_DIR / "static" / "sounds" / "domain_expand.wav"
+SONG_DIR = Path(r"D:\lib\CODEGAMES\VIVY\song")
+SONG_SUFFIXES = {".wav"}
+SING_TRIGGER_KEYWORDS = (
+    "唱歌", "唱首歌", "唱一首", "给我唱", "你唱", "来首歌", "来一首歌",
+    "放首歌", "播放歌曲", "哄我", "安慰我", "我心情不好", "我很难过"
+)
+STOP_SONG_TRIGGER_KEYWORDS = ("停止唱歌", "别唱了", "停歌", "停止播放", "暂停歌曲")
+IMMERSIVE_AUTOSAVE_PATH = PROJECT_DIR / ".vivy_immersive_autosave.md"
+IMMERSIVE_RECENT_FILE = PROJECT_DIR / ".immersive_recent.json"
+
+
+def _immersive_load_recent(max_n: int = 10) -> list[str]:
+    if not IMMERSIVE_RECENT_FILE.exists():
+        return []
+    try:
+        data = json.loads(IMMERSIVE_RECENT_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+        out = []
+        for x in data:
+            p = Path(str(x))
+            if p.is_file():
+                out.append(str(p.resolve()))
+            if len(out) >= max_n:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _immersive_push_recent(path: str, max_n: int = 10) -> None:
+    try:
+        p = str(Path(path).resolve())
+    except OSError:
+        return
+    cur = []
+    if IMMERSIVE_RECENT_FILE.exists():
+        try:
+            old = json.loads(IMMERSIVE_RECENT_FILE.read_text(encoding="utf-8"))
+            if isinstance(old, list):
+                cur = [str(Path(x).resolve()) for x in old if Path(x).is_file()]
+        except Exception:
+            cur = []
+    lst = [p] + [x for x in cur if x != p]
+    lst = lst[:max_n]
+    try:
+        IMMERSIVE_RECENT_FILE.write_text(json.dumps(lst, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _ease_out_cubic(t: float) -> float:
     t = max(0.0, min(1.0, t))
     p = 1.0 - t
     return 1.0 - p * p * p
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, 'true' if default else 'false')).strip().lower()
+    return raw in ('1', 'true', 'yes', 'y', 'on')
 
 
 class WorkerSignals(QObject):
@@ -504,11 +594,8 @@ class CreativeAvatarDock(QWidget):
         sh = self._label.sizeHint()
         lw = max(self._label.minimumWidth(), sh.width())
         lh = max(self._label.minimumHeight(), sh.height())
-        usable = max(1, self.height() - action_h - (8 if action_h else 0))
-        # 待机/窄窗时 sizeHint 可能大于 dock，不缩会画出父控件遭系统裁切
-        lw = min(lw, max(1, self.width()))
-        lh = min(lh, usable)
         x = max(0, (self.width() - lw) // 2)
+        usable = self.height() - action_h - (8 if action_h else 0)
         y = max(self._pad // 2, max(0, (usable - lh) // 2))
         self._label.setGeometry(x, y, lw, lh)
         if action_h:
@@ -527,6 +614,519 @@ class CreativeAvatarDock(QWidget):
         )
 
 
+class ImmersiveWritingWindow(QWidget):
+    """仅在 VIVY 内：大屏沉浸写作，调用本机 /api/office_passage_stream，不依赖 Office 插件。"""
+
+    def __init__(self, pet: "DesktopPet"):
+        super().__init__(None, Qt.WindowType.Window)
+        self._pet = pet
+        self._current_path: Path | None = None
+        self._dirty = False
+        self._suppress_dirty = False
+
+        self.setWindowTitle("VIVY 沉浸写作")
+        self.setMinimumSize(640, 420)
+        self.resize(960, 680)
+        self.setStyleSheet(
+            """
+            ImmersiveWritingWindow {
+                background: #080e14;
+            }
+            QPlainTextEdit#imWriteEditor {
+                background: #0c141d;
+                color: #e8f4ff;
+                border: 1px solid rgba(60, 160, 210, 100);
+                border-radius: 10px;
+                padding: 18px 22px;
+                font-size: 15px;
+                selection-background-color: rgba(55, 214, 255, 120);
+            }
+            QTextEdit#imWriteAssist {
+                background: #0a1018;
+                color: #c5e8ff;
+                border: 1px solid rgba(80, 200, 255, 80);
+                border-radius: 8px;
+                padding: 10px;
+                font-size: 12px;
+            }
+            QPushButton#imBarBtn {
+                background: rgba(32, 120, 168, 200);
+                border: 1px solid rgba(120, 220, 255, 150);
+                border-radius: 7px;
+                padding: 5px 12px;
+                color: #f2fbff;
+                font-size: 12px;
+            }
+            QPushButton#imBarBtn:hover { background: rgba(48, 150, 200, 220); }
+            QPushButton#imBarBtn:disabled { background: rgba(40, 60, 80, 150); color: #8899aa; }
+            QLabel#imBarLbl { color: #9ecfe8; font-size: 12px; }
+            """
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(6)
+
+        def mk_btn(text, slot):
+            b = QPushButton(text)
+            b.setObjectName("imBarBtn")
+            b.clicked.connect(slot)
+            return b
+
+        bar1 = QHBoxLayout()
+        bar1.setSpacing(6)
+        self.btn_open = mk_btn("打开", self._open_file)
+        self._recent_menu = QMenu(self)
+        self._recent_menu.aboutToShow.connect(self._fill_recent_menu)
+        self.btn_recent = QPushButton("最近")
+        self.btn_recent.setObjectName("imBarBtn")
+        self.btn_recent.setMenu(self._recent_menu)
+        self.btn_new = mk_btn("新建", self._new_file)
+        self.btn_save = mk_btn("保存", self._save_file)
+        self.btn_save_as = mk_btn("另存为", self._save_as)
+        self.btn_restore_bak = mk_btn("恢复备份", self._restore_autosave)
+        self.btn_full = mk_btn("全屏", self._toggle_fullscreen)
+        self.btn_focus = mk_btn("专注", self._toggle_focus_assist)
+        self.btn_find = mk_btn("查找", self._find_in_text)
+        for w in (
+            self.btn_open,
+            self.btn_recent,
+            self.btn_new,
+            self.btn_save,
+            self.btn_save_as,
+            self.btn_restore_bak,
+            self.btn_full,
+            self.btn_focus,
+            self.btn_find,
+        ):
+            bar1.addWidget(w)
+        bar1.addStretch(1)
+        self.lbl_autosave = QLabel("")
+        self.lbl_autosave.setObjectName("imBarLbl")
+        self.lbl_autosave.setStyleSheet("color: rgba(150,200,220,160); font-size: 11px;")
+        bar1.addWidget(self.lbl_autosave)
+        self.spin_goal = QSpinBox()
+        self.spin_goal.setRange(0, 200_000)
+        self.spin_goal.setSpecialValueText("目标字数")
+        self.spin_goal.setValue(0)
+        self.spin_goal.setMaximumWidth(100)
+        self.spin_goal.setToolTip("0=不显示目标；设为字数后顶栏显示进度")
+        self.spin_goal.valueChanged.connect(lambda _v: self._refresh_word_count())
+        bar1.addWidget(self.spin_goal)
+        self.lbl_count = QLabel("0 字")
+        self.lbl_count.setObjectName("imBarLbl")
+        bar1.addWidget(self.lbl_count)
+        self.btn_close = mk_btn("收起", self._close_safe)
+        bar1.addWidget(self.btn_close)
+        root.addLayout(bar1)
+
+        bar2 = QHBoxLayout()
+        bar2.setSpacing(6)
+        self.btn_polish = mk_btn("润色", lambda: self._assist("polish"))
+        self.btn_continue = mk_btn("续写", lambda: self._assist("continue"))
+        self.btn_critique = mk_btn("点评", lambda: self._assist("critique"))
+        self.btn_improve = mk_btn("加强", lambda: self._assist("improve"))
+        self.btn_custom = mk_btn("自定义…", self._assist_custom)
+        self._assist_buttons = [
+            self.btn_polish,
+            self.btn_continue,
+            self.btn_critique,
+            self.btn_improve,
+            self.btn_custom,
+        ]
+        for w in self._assist_buttons:
+            bar2.addWidget(w)
+        bar2.addStretch(1)
+        root.addLayout(bar2)
+
+        self.assist_wrap = QWidget()
+        aw = QVBoxLayout(self.assist_wrap)
+        aw.setContentsMargins(0, 0, 0, 0)
+        aw.setSpacing(4)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setObjectName("imWriteEditor")
+        self.editor.setPlaceholderText(
+            "在此专注写作…\n"
+            "快捷键：Ctrl+S 保存，Ctrl+O 打开，Ctrl+N 新建，Ctrl+F 查找，F11 全屏，Esc 退出全屏。\n"
+            "选中一段再点「润色 / 加强」等；未选则对全文（过长会截断）。"
+        )
+        self.editor.textChanged.connect(self._on_text_changed)
+        ef = QFont(self.editor.font())
+        ef.setPointSize(15)
+        ef.setFamilies(
+            ["Microsoft YaHei UI", "微软雅黑", "PingFang SC", "Source Han Sans SC", "sans-serif"]
+        )
+        self.editor.setFont(ef)
+
+        self.assist = QTextEdit()
+        self.assist.setObjectName("imWriteAssist")
+        self.assist.setReadOnly(True)
+        self.assist.setPlaceholderText("VIVY 输出在此。可用下方按钮插入正文或替换选区。")
+        self.assist.setMinimumHeight(100)
+        self.assist.setMaximumHeight(180)
+        aw.addWidget(self.assist)
+
+        assist_btns = QHBoxLayout()
+        assist_btns.setSpacing(6)
+        self.btn_copy_assist = mk_btn("复制输出", self._copy_assist)
+        self.btn_insert_assist = mk_btn("插入到光标", self._insert_assist_at_cursor)
+        self.btn_replace_assist = mk_btn("替换选区", self._replace_selection_with_assist)
+        self._assist_output_buttons = [self.btn_copy_assist, self.btn_insert_assist, self.btn_replace_assist]
+        for w in self._assist_output_buttons:
+            assist_btns.addWidget(w)
+        assist_btns.addStretch(1)
+        aw.addLayout(assist_btns)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.editor)
+        splitter.addWidget(self.assist_wrap)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 1)
+        root.addWidget(splitter, 1)
+
+        self._focus_assist_hidden = False
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(45_000)
+        self._autosave_timer.timeout.connect(self._autosave_tick)
+        self._autosave_timer.start()
+
+        QShortcut(QKeySequence.StandardKey.Save, self, self._save_file)
+        QShortcut(QKeySequence.StandardKey.Open, self, self._open_file)
+        QShortcut(QKeySequence.StandardKey.New, self, self._new_file)
+        QShortcut(QKeySequence.StandardKey.Find, self, self._find_in_text)
+        QShortcut(QKeySequence(Qt.Key.Key_F11), self, self._toggle_fullscreen)
+        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self._on_escape)
+        esc.setContext(Qt.ShortcutContext.WindowShortcut)
+
+    def set_assist_busy(self, busy: bool):
+        for b in self._assist_buttons:
+            b.setDisabled(busy)
+        for b in self._assist_output_buttons:
+            b.setDisabled(busy)
+
+    def _on_text_changed(self):
+        if self._suppress_dirty:
+            return
+        self._dirty = True
+        self._refresh_word_count()
+
+    def _refresh_word_count(self):
+        t = self.editor.toPlainText()
+        n = len(t.replace("\n", "").replace("\r", ""))
+        g = self.spin_goal.value()
+        if g > 0:
+            self.lbl_count.setText(f"{n} / {g} 字")
+            if n >= g:
+                self.lbl_count.setStyleSheet("color: #7fe8b0; font-weight: 600;")
+            else:
+                self.lbl_count.setStyleSheet("")
+        else:
+            self.lbl_count.setText(f"{n} 字")
+            self.lbl_count.setStyleSheet("")
+
+    def _toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            self.btn_full.setText("全屏")
+        else:
+            self.showFullScreen()
+            self.btn_full.setText("退出全屏")
+
+    def _confirm_discard(self) -> bool:
+        if not self._dirty:
+            return True
+        r = QMessageBox.question(
+            self,
+            "沉浸写作",
+            "有未保存的修改，确定收起窗口吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return r == QMessageBox.StandardButton.Yes
+
+    def _confirm_discard_open(self) -> bool:
+        if not self._dirty:
+            return True
+        r = QMessageBox.question(
+            self,
+            "沉浸写作",
+            "未保存的修改将丢失，确定打开新文件吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return r == QMessageBox.StandardButton.Yes
+
+    def _fill_recent_menu(self) -> None:
+        self._recent_menu.clear()
+        paths = _immersive_load_recent(14)
+        if not paths:
+            a = self._recent_menu.addAction("（暂无最近文件）")
+            a.setEnabled(False)
+            return
+        for p in paths:
+            act = self._recent_menu.addAction(Path(p).name)
+            act.triggered.connect(lambda *_, path=p: self._open_recent(path))
+
+    def _open_recent(self, path: str) -> None:
+        if self._dirty and not self._confirm_discard_open():
+            return
+        self._load_document_from_path(path)
+
+    def _new_file(self) -> None:
+        if self._dirty and not self._confirm_discard_open():
+            return
+        self._suppress_dirty = True
+        self.editor.clear()
+        self._suppress_dirty = False
+        self._dirty = False
+        self._current_path = None
+        self.setWindowTitle("VIVY 沉浸写作")
+        self._refresh_word_count()
+
+    def _load_document_from_path(self, path: str) -> None:
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except OSError as e:
+            QMessageBox.warning(self, "沉浸写作", f"无法读取：{e}")
+            return
+        self._suppress_dirty = True
+        self.editor.setPlainText(text)
+        self._suppress_dirty = False
+        self._dirty = False
+        self._current_path = Path(path)
+        _immersive_push_recent(path)
+        self.setWindowTitle(f"VIVY 沉浸写作 — {Path(path).name}")
+        self._refresh_word_count()
+
+    def _open_file(self):
+        if self._dirty and not self._confirm_discard_open():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "打开文本",
+            str(PROJECT_DIR),
+            "Markdown / 文本 (*.md *.txt);;All (*.*)",
+        )
+        if not path:
+            return
+        self._load_document_from_path(path)
+
+    def _autosave_tick(self) -> None:
+        text = self.editor.toPlainText()
+        if not text.strip():
+            return
+        try:
+            IMMERSIVE_AUTOSAVE_PATH.write_text(text, encoding="utf-8")
+            self.lbl_autosave.setText(time.strftime("%H:%M 备份"))
+        except OSError:
+            self.lbl_autosave.setText("备份失败")
+
+    def _restore_autosave(self) -> None:
+        if not IMMERSIVE_AUTOSAVE_PATH.exists():
+            QMessageBox.information(self, "沉浸写作", "暂无自动备份（.vivy_immersive_autosave.md）。")
+            return
+        if self._dirty:
+            r = QMessageBox.question(
+                self,
+                "沉浸写作",
+                "当前内容未保存，用备份覆盖吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            text = IMMERSIVE_AUTOSAVE_PATH.read_text(encoding="utf-8", errors="ignore")
+        except OSError as e:
+            QMessageBox.warning(self, "沉浸写作", f"读取备份失败：{e}")
+            return
+        self._suppress_dirty = True
+        self.editor.setPlainText(text)
+        self._suppress_dirty = False
+        self._dirty = True
+        self._current_path = None
+        self.setWindowTitle("VIVY 沉浸写作（从备份恢复）")
+        self._refresh_word_count()
+        self._pet._set_status_text("已从自动备份恢复，建议另存为正式文件。")
+
+    def _toggle_focus_assist(self) -> None:
+        self._focus_assist_hidden = not self._focus_assist_hidden
+        self.assist_wrap.setVisible(not self._focus_assist_hidden)
+        self.btn_focus.setText("显示辅助区" if self._focus_assist_hidden else "专注")
+
+    def _find_in_text(self) -> None:
+        needle, ok = QInputDialog.getText(self, "查找", "查找内容：")
+        if not ok or not needle:
+            return
+        if not self.editor.find(needle):
+            self.editor.moveCursor(QTextCursor.MoveOperation.Start)
+            if not self.editor.find(needle):
+                QMessageBox.information(self, "查找", "未找到匹配内容。")
+
+    def _on_escape(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+            self.btn_full.setText("全屏")
+
+    def _copy_assist(self) -> None:
+        t = self.assist.toPlainText().strip()
+        if t:
+            QApplication.clipboard().setText(t)
+
+    def _insert_assist_at_cursor(self) -> None:
+        t = self.assist.toPlainText().strip()
+        if not t:
+            return
+        cur = self.editor.textCursor()
+        cur.insertText("\n" + t + "\n")
+
+    def _replace_selection_with_assist(self) -> None:
+        t = self.assist.toPlainText().strip()
+        if not t:
+            return
+        cur = self.editor.textCursor()
+        if cur.hasSelection():
+            cur.insertText(t)
+        else:
+            self._insert_assist_at_cursor()
+
+    def _assist_custom(self) -> None:
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "自定义指令",
+            "希望 VIVY 对当前选区（若无选区则对全文）做什么？",
+        )
+        if ok and (text or "").strip():
+            self._assist("free", goal=(text or "").strip())
+
+    def _passage_and_context(self) -> tuple[str, str]:
+        cur = self.editor.textCursor()
+        full = self.editor.toPlainText()
+        if cur.hasSelection():
+            passage = cur.selectedText().replace("\u2029", "\n").strip()
+            start = min(cur.selectionStart(), cur.anchor())
+            ctx_start = max(0, start - 1200)
+            context = full[ctx_start:start]
+        else:
+            passage = full.strip()
+            context = ""
+        if context:
+            context = context[-OFFICE_CONTEXT_MAX:]
+        return passage, context
+
+    def _save_file(self):
+        text = self.editor.toPlainText()
+        if self._current_path is not None:
+            try:
+                self._current_path.write_text(text, encoding="utf-8")
+                self._dirty = False
+                _immersive_push_recent(str(self._current_path))
+                self._pet._set_status_text("沉浸写作已保存。")
+            except OSError as e:
+                QMessageBox.warning(self, "沉浸写作", f"保存失败：{e}")
+            return
+        self._save_as()
+
+    def _save_as(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "另存为",
+            str(PROJECT_DIR / "草稿.md"),
+            "Markdown (*.md);;文本 (*.txt);;All (*.*)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.editor.toPlainText(), encoding="utf-8")
+        except OSError as e:
+            QMessageBox.warning(self, "沉浸写作", f"保存失败：{e}")
+            return
+        self._current_path = Path(path)
+        self._dirty = False
+        _immersive_push_recent(path)
+        self.setWindowTitle(f"VIVY 沉浸写作 — {Path(path).name}")
+        self._pet._set_status_text("沉浸写作已另存为。")
+
+    def _assist(self, action: str, goal: str | None = None):
+        pet = self._pet
+        if pet._busy:
+            return
+        passage, context_excerpt = self._passage_and_context()
+        if not passage:
+            QMessageBox.information(self, "沉浸写作", "先写一些内容，或选中一段后再请求辅助。")
+            return
+        if len(passage) > OFFICE_PASSAGE_MAX:
+            passage = passage[:OFFICE_PASSAGE_MAX]
+
+        def _request_stream():
+            import json
+
+            url = f"{pet.api_base}/api/office_passage_stream"
+            payload = {
+                "user_id": pet.user_id,
+                "passage": passage,
+                "action": action,
+                "goal": (goal or "").strip(),
+                "context_excerpt": context_excerpt or "",
+            }
+            resp = requests.post(url, json=payload, timeout=30, stream=True)
+            resp.raise_for_status()
+            assembled = ""
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                line = raw.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                if obj.get("error"):
+                    raise RuntimeError(obj["error"])
+                if obj.get("done"):
+                    break
+                delta = obj.get("delta") or ""
+                if delta:
+                    assembled += delta
+                    yield assembled
+
+        def _ok_stream(_unused):
+            pass
+
+        def _err_stream(msg):
+            self.assist.setPlainText(f"请求失败：{msg}")
+
+        def _consume(progress_callback=None):
+            for partial in _request_stream():
+                if progress_callback is not None:
+                    progress_callback(partial)
+            return {"ok": True}
+
+        self.assist.clear()
+        pet._run_async(
+            _consume,
+            _ok_stream,
+            _err_stream,
+            on_progress=lambda p: self.assist.setPlainText(str(p)),
+            thinking_text="VIVY 沉浸写作辅助中…",
+        )
+
+    def _close_safe(self):
+        if not self._confirm_discard():
+            return
+        self.hide()
+
+    def closeEvent(self, event):
+        if not self._confirm_discard():
+            event.ignore()
+            return
+        self.hide()
+        event.ignore()
+
+
 class DesktopPet(QWidget):
     def __init__(self, api_base: str):
         super().__init__()
@@ -535,6 +1135,7 @@ class DesktopPet(QWidget):
 
         self._dragging = False
         self._drag_offset = QPoint()
+        self._drag_started_while_collapsed = False
         self.latest_reply = ""
         self.thread_pool = QThreadPool.globalInstance()
         self._busy = False
@@ -543,14 +1144,25 @@ class DesktopPet(QWidget):
         self._loaded_doc_path: str | None = None
         self._immersive_writing_window: ImmersiveWritingWindow | None = None
 
+        # voice
+        self.auto_voice_reply = _env_bool('VIVY_AUTO_VOICE_REPLY', True)
+        self.stream_tts_enabled = _env_bool('VIVY_STREAM_TTS', True)
+        self._stream_tts_buffer = ''
+
+        # local song player
+        self._song_is_playing = False
+        self._pending_song_path: Path | None = None
+        self._song_delay_timer = QTimer(self)
+        self._song_delay_timer.setSingleShot(True)
+        self._song_delay_timer.timeout.connect(self._play_pending_song_now)
+
         # idle / wander
         self._idle_collapsed = False
         self._last_interaction_ts = time.time()
         self._idle_timeout_s = int(os.getenv("VIVY_IDLE_TIMEOUT", "18"))
-        self._expanded_size = QSize(556, 280)
-        self._expanded_size_with_memory = QSize(720, 296)
-        # 需 ≥ avatar_dock 内头像与边距；过小会裁切 GIF（原 170×170 低于 dock minHeight 198）
-        self._collapsed_size = QSize(220, 236)
+        self._expanded_size = QSize(620, 332)
+        self._expanded_size_with_memory = QSize(784, 348)
+        self._collapsed_size = QSize(292, 302)
 
         # bubble priority: prevent system/status messages from overwriting replies
         self._bubble_lock_until_ts = 0.0
@@ -567,6 +1179,8 @@ class DesktopPet(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # 稳定版：默认关闭按钮级透明动画，减少透明主窗上的分层更新压力。
+        self._use_button_opacity_fx = _env_bool("VIVY_SAFE_BUTTON_FADE", False)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -604,14 +1218,17 @@ class DesktopPet(QWidget):
 
         self.controls_layout.addWidget(self.bubble)
 
-        self._urban_inspiration_panel = UrbanInspirationPanel(
-            self.controls_wrap,
-            interval_ms=int(os.getenv("VIVY_INSPIRATION_INTERVAL_MS", "30000")),
-        )
-        self._urban_inspiration_panel.hide()
+        if UrbanInspirationPanel is not None:
+            self._urban_inspiration_panel = UrbanInspirationPanel(
+                self.controls_wrap,
+                interval_ms=int(os.getenv("VIVY_INSPIRATION_INTERVAL_MS", "30000")),
+            )
+            self._urban_inspiration_panel.hide()
+            self.controls_layout.addWidget(self._urban_inspiration_panel)
+        else:
+            self._urban_inspiration_panel = None
         self._urban_inspiration_space_added = False
         self._urban_inspiration_extra_h = int(os.getenv("VIVY_INSPIRATION_PANEL_H", "58"))
-        self.controls_layout.addWidget(self._urban_inspiration_panel)
 
         self.options_wrap = QFrame()
         self.options_layout = QVBoxLayout(self.options_wrap)
@@ -622,10 +1239,11 @@ class DesktopPet(QWidget):
 
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumHeight(150)
-        self.image_label.setMaximumHeight(200)
-        self.image_label.setMinimumWidth(120)
-        self.image_label.setMaximumWidth(160)
+        self.image_label.setMinimumHeight(180)
+        self.image_label.setMaximumHeight(260)
+        self.image_label.setMinimumWidth(150)
+        self.image_label.setMaximumWidth(220)
+        self.image_label.setStyleSheet("background: transparent;")
         self._setup_avatar()
 
         self.creative_actions = QWidget()
@@ -656,7 +1274,7 @@ class DesktopPet(QWidget):
 
         self.btn_domain_immerse = QPushButton("沉浸写作")
         self.btn_domain_immerse.setObjectName("vivyDomainBtn")
-        self.btn_domain_immerse.setToolTip("大屏专注写作（仅 VIVY 内）")
+        self.btn_domain_immerse.setToolTip("打开大屏专注写作窗口（仅 VIVY 内）")
         self.btn_domain_immerse.clicked.connect(self._open_immersive_writing)
 
         self._creative_domain_buttons = [
@@ -665,10 +1283,11 @@ class DesktopPet(QWidget):
             self.btn_domain_clear,
             self.btn_domain_immerse,
         ]
-        for b in self._creative_domain_buttons:
-            op = QGraphicsOpacityEffect(b)
-            op.setOpacity(0.0)
-            b.setGraphicsEffect(op)
+        if self._use_button_opacity_fx:
+            for b in self._creative_domain_buttons:
+                op = QGraphicsOpacityEffect(b)
+                op.setOpacity(0.0)
+                b.setGraphicsEffect(op)
         for b in (self.btn_domain_doc, self.btn_domain_spark, self.btn_domain_clear):
             ca_row1.addWidget(b)
         ca_row1.addStretch(1)
@@ -684,32 +1303,32 @@ class DesktopPet(QWidget):
         self.avatar_dock = CreativeAvatarDock(
             self.domain_aura, self.image_label, self.creative_actions
         )
-        self.avatar_dock.setMinimumWidth(120 + 48)
-        self.avatar_dock.setMaximumWidth(160 + 48)
+        self.avatar_dock.setMinimumWidth(150 + 48)
+        self.avatar_dock.setMaximumWidth(220 + 48)
         self._sync_avatar_dock_heights()
 
-        self._command_effect = CommandEffect(None, target_text="创作模式")
+        self._command_effect = CommandEffect(self, target_text="创作模式") if CommandEffect else None
         self._command_effect_w = int(os.getenv("VIVY_COMMAND_FX_W", "220"))
         self._command_effect_h = int(os.getenv("VIVY_COMMAND_FX_H", "44"))
         self._command_effect_margin_top = int(os.getenv("VIVY_COMMAND_FX_MARGIN_TOP", "14"))
 
-        # 「今日灵感」用同款逐字落屏条（独立于创作模式）
-        self._inspiration_effect = CommandEffect(None, target_text="")
-        self._inspiration_effect_w = int(os.getenv("VIVY_INSP_FX_W", "260"))
-        self._inspiration_effect_h = int(os.getenv("VIVY_INSP_FX_H", "44"))
+        self._inspiration_effect = CommandEffect(self, target_text="") if CommandEffect else None
+        self._inspiration_effect_w = int(os.getenv("VIVY_INSP_FX_W", "360"))
+        self._inspiration_effect_h = int(os.getenv("VIVY_INSP_FX_H", "88"))
         self._inspiration_effect_margin_top = int(os.getenv("VIVY_INSP_FX_MARGIN_TOP", "14"))
+        self._last_inspiration_overlay_text = ""
 
         # quick actions
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
 
         self.btn_inspiration = QPushButton("今日灵感")
-        self.btn_inspiration.setToolTip("本地随机「都市指令」式碎片灵感；可每 30 秒自动刷新（可环境变量调整）")
+        self.btn_inspiration.setToolTip("获取今天的冲浪见闻 / 灵感分享")
         self.btn_inspiration.clicked.connect(self._on_today_inspiration)
         action_row.addWidget(self.btn_inspiration)
 
         self.btn_improv_sketch = QPushButton("脑洞短剧")
-        self.btn_improv_sketch.setToolTip("即兴生成一段无厘头小剧场（对白 + 场景）")
+        self.btn_improv_sketch.setToolTip("即兴生成一段无厘头小剧场")
         self.btn_improv_sketch.clicked.connect(lambda: self._send_message(IMPROV_SKETCH_MESSAGE))
         action_row.addWidget(self.btn_improv_sketch)
 
@@ -741,6 +1360,15 @@ class DesktopPet(QWidget):
         self.btn_send = QPushButton("发送")
         self.btn_send.clicked.connect(self._send_from_input)
         input_row.addWidget(self.btn_send)
+
+        self.btn_voice = QPushButton("🎤语音")
+        self.btn_voice.clicked.connect(self._start_voice_input)
+        input_row.addWidget(self.btn_voice)
+
+        self.btn_voice_toggle = QPushButton()
+        self.btn_voice_toggle.clicked.connect(self._toggle_auto_voice_reply)
+        input_row.addWidget(self.btn_voice_toggle)
+        self._update_voice_toggle_button()
 
         self.controls_layout.addLayout(input_row)
 
@@ -928,46 +1556,86 @@ class DesktopPet(QWidget):
         self._apply_window_size()
         self.move(100, 120)
         self._set_interest_signal("")
-        for _w in (self.image_label, self.domain_aura, self.avatar_dock):
-            _w.installEventFilter(self)
+
+    def _target_avatar_size(self) -> QSize:
+        """根据当前头像区域，给出更稳妥的高质量缩放目标尺寸。"""
+        if getattr(self, "image_label", None) is None:
+            return QSize(220, 260)
+        w = max(self.image_label.minimumWidth(), self.image_label.width(), 150)
+        h = max(self.image_label.minimumHeight(), self.image_label.height(), 180)
+        return QSize(min(w, self.image_label.maximumWidth()), min(h, self.image_label.maximumHeight()))
+
+    def _set_avatar_pixmap_high_quality(self, pix):
+        if pix is None or pix.isNull():
+            return
+        target = self._target_avatar_size()
+        scaled = pix.scaled(
+            target,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image_label.setPixmap(scaled)
+
+    def _update_avatar_frame(self, *_args):
+        if not hasattr(self, "movie") or self.movie is None:
+            return
+        pix = self.movie.currentPixmap()
+        if pix.isNull():
+            return
+        self._set_avatar_pixmap_high_quality(pix)
 
     def _setup_avatar(self):
-        # Use GIF as initial avatar; keep aspect ratio and smooth scaling.
+        # 优先使用 GIF；不直接让 QMovie 在 QLabel 内部缩放，
+        # 而是逐帧取出后用 SmoothTransformation 缩放，画质更稳。
+        self.movie = None
+        self._avatar_source_size = None
+
         if GIF_PATH.exists():
             self.movie = QMovie(str(GIF_PATH))
             self.movie.setCacheMode(QMovie.CacheMode.CacheAll)
+            self.movie.setBackgroundColor(Qt.GlobalColor.transparent)
+
             reader = QImageReader(str(GIF_PATH))
             src_size = reader.size()
-            target_w = 240
-            if src_size.isValid() and src_size.width() > 0:
-                target_h = int(target_w * (src_size.height() / src_size.width()))
-                self.movie.setScaledSize(src_size.scaled(target_w, target_h, Qt.AspectRatioMode.KeepAspectRatio))
-            else:
-                self.movie.setScaledSize(self.image_label.size())
-            self.image_label.setMovie(self.movie)
+            if src_size.isValid():
+                self._avatar_source_size = src_size
+
+            self.movie.frameChanged.connect(self._update_avatar_frame)
             self.movie.start()
+            self._update_avatar_frame()
             return
 
         # Fallback to PNG if GIF is missing
         from PyQt6.QtGui import QPixmap
 
         pix = QPixmap(str(PNG_FALLBACK_PATH))
-        self.image_label.setPixmap(pix.scaledToWidth(240, Qt.TransformationMode.SmoothTransformation))
+        if not pix.isNull():
+            self._set_avatar_pixmap_high_quality(pix)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "movie") and self.movie is not None:
-            reader = QImageReader(str(GIF_PATH))
-            src_size = reader.size()
-            if src_size.isValid() and src_size.width() > 0:
-                target_w = min(260, max(220, self.image_label.width()))
-                target_h = int(target_w * (src_size.height() / src_size.width()))
-                self.movie.setScaledSize(src_size.scaled(target_w, target_h, Qt.AspectRatioMode.KeepAspectRatio))
-        self._reposition_command_effect()
-
-    def moveEvent(self, event: QMoveEvent):
-        super().moveEvent(event)
-        self._reposition_command_effect()
+            self._update_avatar_frame()
+        try:
+            if getattr(self, "_command_effect", None) is not None and self.chat_mode == "creative":
+                self._play_overlay_effect(
+                    self._command_effect,
+                    "创作模式",
+                    self._command_effect_w,
+                    self._command_effect_h,
+                    self._command_effect_margin_top,
+                )
+            if getattr(self, "_inspiration_effect", None) is not None and self._inspiration_effect.isVisible():
+                self._show_overlay_text_static(
+                    self._inspiration_effect,
+                    getattr(self, "_last_inspiration_overlay_text", ""),
+                    self._inspiration_effect_w,
+                    self._inspiration_effect_h,
+                    self._inspiration_effect_margin_top,
+                    stack_above_command=(self.chat_mode == "creative"),
+                )
+        except Exception:
+            pass
 
     def _load_or_create_user_id(self) -> str:
         if USER_ID_FILE.exists():
@@ -1000,10 +1668,15 @@ class DesktopPet(QWidget):
     def _set_busy(self, busy: bool, thinking_text: str | None = "VIVY 思考中..."):
         self._busy = busy
         self.btn_inspiration.setDisabled(busy)
-        self.btn_improv_sketch.setDisabled(busy)
+        if hasattr(self, "btn_improv_sketch"):
+            self.btn_improv_sketch.setDisabled(busy)
         self.btn_question.setDisabled(busy)
         self.btn_send.setDisabled(busy)
         self.input_edit.setDisabled(busy)
+        if hasattr(self, "btn_voice"):
+            self.btn_voice.setDisabled(busy)
+        if hasattr(self, "btn_voice_toggle"):
+            self.btn_voice_toggle.setDisabled(False)
         self.btn_interest_yes.setDisabled(busy)
         self.btn_interest_no.setDisabled(busy)
         self.btn_interest_clear.setDisabled(busy)
@@ -1020,7 +1693,7 @@ class DesktopPet(QWidget):
 
     def _run_async(self, fn, on_success, on_error, on_progress=None, thinking_text: str | None = "VIVY 思考中..."):
         if self._busy:
-            self._set_status_text("当前仍在处理上一请求（例如正在回复或云 Agent），请稍候再试。")
+            self._set_status_text("当前仍在处理上一请求，请稍候再试。")
             return
         self._touch()
         self._set_busy(True, thinking_text=thinking_text)
@@ -1050,104 +1723,259 @@ class DesktopPet(QWidget):
         self._set_busy(False)
         callback(error_msg)
 
-    def _on_today_inspiration(self):
-        """都市指令式本地随机灵感；首次展开垫高窗口，并启动可选定时刷新。"""
-        self._touch()
-        panel = self._urban_inspiration_panel
-        if not panel.isVisible():
-            panel.show()
-            if not self._urban_inspiration_space_added:
-                self._urban_inspiration_space_added = True
-                dh = self._urban_inspiration_extra_h
-                self._expanded_size = QSize(
-                    self._expanded_size.width(),
-                    self._expanded_size.height() + dh,
-                )
-                self._expanded_size_with_memory = QSize(
-                    self._expanded_size_with_memory.width(),
-                    self._expanded_size_with_memory.height() + dh,
-                )
-                self._apply_window_size()
-        panel.manual_refresh()
-        panel.set_auto_refresh(True)
 
-        # 句子展现形式：像「创作模式」一样先乱码后逐字落屏
-        txt = generate_inspiration_short(max_chars=int(os.getenv("VIVY_INSP_MAX_CHARS", "48")))
-        self._inspiration_effect.set_target_text(txt)
-        self._inspiration_effect.fit_to_text(
-            max_text_width=int(os.getenv("VIVY_FX_MAX_TEXT_W", "420")),
-            max_outer_height=int(os.getenv("VIVY_FX_MAX_OUTER_H", "132")),
-            min_outer_width=int(os.getenv("VIVY_INSP_FX_MIN_W", "200")),
+    def _safe_generate_inspiration(self) -> str:
+        max_chars = max(28, int(os.getenv("VIVY_INSP_MAX_CHARS", "56")))
+        try:
+            if generate_inspiration is not None:
+                val = (generate_inspiration() or "").strip()
+                if val:
+                    return val
+            if generate_inspiration_short is not None:
+                val = (generate_inspiration_short(max_chars=max_chars) or "").strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+        return random.choice(_FALLBACK_INSPIRATION_POOL)
+
+    def _play_overlay_effect(self, effect, text: str, width: int, height: int, margin_top: int, stack_above_command: bool = False):
+        if effect is None or self._idle_collapsed:
+            return
+        try:
+            if hasattr(effect, "target_text"):
+                effect.target_text = text
+            elif hasattr(effect, "set_target_text"):
+                effect.set_target_text(text)
+
+            anchor = self.image_label
+            dx = max(0, (anchor.width() - width) // 2)
+            dy = -height - max(0, margin_top)
+
+            if stack_above_command and getattr(self, "_command_effect", None) is not None:
+                ce = self._command_effect
+                try:
+                    if ce.isVisible():
+                        dy = -(int(getattr(ce, "height")()) + max(0, self._command_effect_margin_top) + 8 + height)
+                except Exception:
+                    pass
+
+            if hasattr(effect, "follow_master"):
+                effect.follow_master(anchor, dx, dy, width, height)
+            if hasattr(effect, "start_effect"):
+                effect.start_effect()
+        except Exception:
+            pass
+
+    def _show_overlay_text_static(self, effect, text: str, width: int, height: int, margin_top: int, stack_above_command: bool = False):
+        if effect is None or self._idle_collapsed:
+            return
+        clean_text = (text or "").strip()
+        if not clean_text:
+            return
+        try:
+            if hasattr(effect, "set_target_text"):
+                effect.set_target_text(clean_text)
+            elif hasattr(effect, "target_text"):
+                effect.target_text = clean_text
+
+            actual_w, actual_h = int(width), int(height)
+            if hasattr(effect, "fit_to_text"):
+                try:
+                    actual_w, actual_h = effect.fit_to_text(
+                        max_text_width=max(int(width), 420),
+                        max_outer_height=max(int(height), 180),
+                        min_outer_width=max(220, min(int(width), 280)),
+                    )
+                except Exception:
+                    actual_w, actual_h = int(width), int(height)
+
+            anchor = self.image_label
+            dx = max(0, (anchor.width() - actual_w) // 2)
+            dy = -actual_h - max(0, int(margin_top))
+
+            if stack_above_command and getattr(self, "_command_effect", None) is not None:
+                ce = self._command_effect
+                try:
+                    if ce.isVisible():
+                        dy = -(int(getattr(ce, "height")()) + max(0, self._command_effect_margin_top) + 8 + actual_h)
+                except Exception:
+                    pass
+
+            if hasattr(effect, "set_offset_from_master"):
+                effect.set_offset_from_master(anchor, dx, dy)
+            elif hasattr(effect, "follow_master"):
+                effect.follow_master(anchor, dx, dy, actual_w, actual_h)
+
+            if hasattr(effect, "_timer"):
+                effect._timer.stop()
+            if hasattr(effect, "_scan_timer"):
+                try:
+                    effect._scan_timer.start()
+                except Exception:
+                    pass
+            if hasattr(effect, "_label"):
+                effect._label.setText(clean_text)
+            effect.show()
+            effect.raise_()
+        except Exception:
+            pass
+
+    def _stop_command_effect(self):
+        ce = getattr(self, "_command_effect", None)
+        if ce is not None and hasattr(ce, "stop_effect"):
+            try:
+                ce.stop_effect()
+            except Exception:
+                pass
+
+    def _stop_inspiration_effect(self):
+        insp = getattr(self, "_inspiration_effect", None)
+        if insp is not None and hasattr(insp, "stop_effect"):
+            try:
+                insp.stop_effect()
+            except Exception:
+                pass
+
+    def _start_command_effect_if_needed(self):
+        if self.chat_mode != "creative" or self._idle_collapsed:
+            return
+        self._play_overlay_effect(
+            self._command_effect,
+            "创作模式",
+            self._command_effect_w,
+            self._command_effect_h,
+            self._command_effect_margin_top,
         )
-        self._place_inspiration_effect()
-        self._inspiration_effect.start_effect()
 
-        # 可选：用云 Agent 联网扩写（更有创作元素）。本地先落屏，Agent 返回后再落屏一次覆盖。
-        use_agent = (os.getenv("VIVY_INSP_USE_AGENT") or "1").strip() not in ("0", "false", "False")
-        api_key = (os.getenv("CURSOR_API_KEY") or "").strip()
-        repo_s = (os.getenv("CURSOR_AGENT_REPO") or "").strip()
-        ref_s = (os.getenv("CURSOR_AGENT_REF") or "").strip()
-        if not use_agent or not api_key or not repo_s:
+    def _on_today_inspiration(self):
+        self._touch()
+        # 统一走后端结构化灵感接口，保持“【今日冲浪见闻】发现/联想/邀请”样式。
+        self._send_message("今天有什么灵感")
+
+    def _set_cursor_cloud_agent_key_interactive(self):
+        self._touch()
+        current = (os.getenv("CURSOR_API_KEY") or "").strip()
+        key, ok = QInputDialog.getText(
+            self,
+            "Cursor 云 Agent API Key",
+            "请输入 Cursor 云 Agent 的 API Key（会保存到 .env 的 CURSOR_API_KEY）：",
+            QLineEdit.EchoMode.Password,
+            current,
+        )
+        if not ok:
+            return
+        new_key = (key or "").strip()
+        if not new_key:
+            QMessageBox.warning(self, "提示", "密钥不能为空。")
+            return
+        _save_env_value("CURSOR_API_KEY", new_key)
+        self._set_status_text("Cursor 云 Agent 密钥已保存。")
+
+    def _open_cursor_cloud_agent_dialog(self):
+        self._touch()
+        if not all([launch_agent, wait_agent_terminal, get_conversation, format_conversation_text]):
+            QMessageBox.information(self, "Cursor 云 Agent", "当前项目缺少 cursor_agent_api 相关模块，暂时无法启用。")
             return
 
-        seed = txt
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Cursor 云 Agent")
+        dlg.resize(520, 400)
+
+        hint = QLabel(
+            "在 GitHub 仓库上启动 Cursor 云 Agent。\n"
+            "这和桌宠日常聊天是两套能力，执行可能需要一段时间。"
+        )
+        hint.setWordWrap(True)
+
+        repo = QLineEdit()
+        repo.setPlaceholderText("https://github.com/owner/repo")
+        repo.setText((os.getenv("CURSOR_AGENT_REPO") or "").strip())
+
+        ref = QLineEdit()
+        ref.setPlaceholderText("main（可留空）")
+        ref.setText((os.getenv("CURSOR_AGENT_REF") or "").strip())
+
+        task = QTextEdit()
+        task.setPlaceholderText("说明要让 Agent 在仓库里完成什么…")
+        task.setMinimumHeight(120)
+
+        form = QFormLayout()
+        form.addRow("仓库 URL", repo)
+        form.addRow("分支 ref", ref)
+        form.addRow("任务说明", task)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(hint)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        repo_s = repo.text().strip()
+        ref_s = ref.text().strip()
+        task_s = task.toPlainText().strip()
+        if not repo_s or not task_s:
+            QMessageBox.warning(self, "Cursor 云 Agent", "请填写仓库 URL 和任务说明。")
+            return
+
+        api_key = (os.getenv("CURSOR_API_KEY") or "").strip()
+        if not api_key:
+            QMessageBox.warning(self, "Cursor 云 Agent", "请先配置 CURSOR_API_KEY。")
+            return
+
+        _save_env_value("CURSOR_AGENT_REPO", repo_s)
+        _save_env_value("CURSOR_AGENT_REF", ref_s)
 
         def _request():
-            prompt = (
-                "你是写作灵感生成器。请联网检索/联想与提示相关的意象、场景细节、微冲突。\n"
-                "要求：只输出 1 行中文灵感句子（不超过 48 字），可带 1 个具体物件 + 1 个场景 + 1 个冲突钩子。\n"
-                "不要解释、不要列表、不要引用来源、不要冒号开头。\n\n"
-                f"提示种子：{seed}\n"
-            )
             created = launch_agent(
                 api_key,
-                prompt_text=prompt,
+                prompt_text=task_s,
                 repository=repo_s,
                 ref=ref_s or None,
             )
             aid = str(created.get("id") or "").strip()
             if not aid:
                 raise RuntimeError(f"启动响应缺少 id：{created!r}")
-            wait_agent_terminal(api_key, aid, max_wait_seconds=240.0, poll_seconds=3.0)
+            final = wait_agent_terminal(api_key, aid)
+            status = str(final.get("status") or "")
             conv = get_conversation(api_key, aid)
-            msgs = conv.get("messages") or []
-            best = ""
-            if isinstance(msgs, list):
-                for m in reversed(msgs):
-                    if not isinstance(m, dict):
-                        continue
-                    if str(m.get("type") or "") != "assistant_message":
-                        continue
-                    best = str(m.get("text") or "").strip()
-                    if best:
-                        break
-            if not best:
-                best = format_conversation_text(conv, max_chars=400).strip()
-            # 取第一行作为落屏文本
-            line = (best.splitlines()[0] if best else "").strip()
-            return {"line": line}
+            body = format_conversation_text(conv)
+            summary = str(final.get("summary") or "").strip()
+            link = ""
+            tgt = final.get("target")
+            if isinstance(tgt, dict):
+                link = str(tgt.get("url") or "").strip()
+            head_parts = [f"【Cursor 云 Agent】状态：{status}"]
+            if summary:
+                head_parts.append(f"摘要：{summary}")
+            if link:
+                head_parts.append(f"链接：{link}")
+            return {"head": "\n".join(head_parts), "body": body}
 
         def _ok(data):
-            line = str((data or {}).get("line") or "").strip()
-            if not line:
-                return
-            max_chars = int(os.getenv("VIVY_INSP_MAX_CHARS", "48"))
-            if len(line) > max_chars:
-                line = line[:max_chars].rstrip("，,;；:：") + "…"
-            self._inspiration_effect.set_target_text(line)
-            self._inspiration_effect.fit_to_text(
-                max_text_width=int(os.getenv("VIVY_FX_MAX_TEXT_W", "420")),
-                max_outer_height=int(os.getenv("VIVY_FX_MAX_OUTER_H", "132")),
-                min_outer_width=int(os.getenv("VIVY_INSP_FX_MIN_W", "200")),
-            )
-            self._place_inspiration_effect()
-            self._inspiration_effect.start_effect()
+            d = data or {}
+            full = ((d.get("head") or "") + "\n\n" + (d.get("body") or "")).strip()
+            self._set_bubble_text(full, kind="reply")
+            self._maybe_speak_reply(d.get("summary") or d.get("head") or "")
+            self._set_status_text("Cursor 云 Agent 已结束，见气泡正文。")
 
         def _err(msg):
-            # 静默失败：不打断本地灵感
-            _ = msg
+            self._set_status_text(f"云 Agent：{msg}")
 
-        self._run_background(_request, on_success=_ok, on_error=_err)
+        self._run_async(
+            _request,
+            _ok,
+            _err,
+            thinking_text="已提交 Cursor 云 Agent，等待结束（可能较久）…",
+        )
 
     def _copy_latest_reply(self):
         text = self.bubble_text.textCursor().selectedText().strip() or self.latest_reply
@@ -1156,13 +1984,99 @@ class DesktopPet(QWidget):
             self.btn_copy_reply.setText("已复制")
             QTimer.singleShot(800, lambda: self.btn_copy_reply.setText("复制回复"))
 
-    def _on_stream_chat_progress(self, payload):
+    def _update_voice_toggle_button(self):
+        if hasattr(self, "btn_voice_toggle"):
+            self.btn_voice_toggle.setText(f"语音回放：{'开' if self.auto_voice_reply else '关'}")
+
+    def _toggle_auto_voice_reply(self):
+        self._touch()
+        self.auto_voice_reply = not self.auto_voice_reply
+        self._update_voice_toggle_button()
+        self._set_status_text(f"语音回放已{'开启' if self.auto_voice_reply else '关闭'}。")
+
+    def _start_voice_input(self):
+        self._touch()
+
+        def _request():
+            timeout_seconds = max(3, int(os.getenv('VIVY_STT_TIMEOUT', '8')))
+            culture = (os.getenv('VIVY_STT_CULTURE') or '').strip()
+            text = recognize_once(timeout_seconds=timeout_seconds, culture=culture or None)
+            return {'text': text}
+
+        def _ok(data):
+            text = ((data or {}).get('text') or '').strip()
+            if not text:
+                self._set_status_text('没有识别到有效文字。')
+                return
+            self.input_edit.setText(text)
+            self.input_edit.setFocus()
+            self._send_from_input()
+
+        def _err(error_msg):
+            self._set_status_text(f"语音识别失败：{error_msg}")
+
+        self._run_async(_request, _ok, _err, thinking_text='VIVY 正在听你说话...')
+
+    def _maybe_speak_reply(self, text: str):
+        spoken = (text or '').strip()
+        if not spoken or not self.auto_voice_reply:
+            return
+        speak_text_async(spoken)
+
+    def _split_stream_tts_units(self, buffer_text: str, flush: bool = False):
+        text = buffer_text or ''
+        if not text:
+            return [], ''
+        strong_seps = '。！？!?\n'
+        out = []
+        start = 0
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch in strong_seps:
+                end = i + 1
+                while end < len(text) and text[end] in '”」』）】 ':
+                    end += 1
+                unit = text[start:end].strip()
+                if unit:
+                    out.append(unit)
+                start = end
+            i += 1
+        remain = text[start:].strip()
+        if flush and remain:
+            out.append(remain)
+            remain = ''
+        return out, remain
+
+    def _on_stream_tts_progress(self, payload):
         if isinstance(payload, dict):
-            partial = str(payload.get("partial") or "")
+            partial = str(payload.get('partial') or '')
+            delta = str(payload.get('delta') or '')
         else:
-            partial = str(payload or "")
+            partial = str(payload or '')
+            delta = ''
         if partial:
             self._set_bubble_text(partial)
+        if not (self.auto_voice_reply and self.stream_tts_enabled and delta):
+            return
+        self._stream_tts_buffer += delta
+        units, remain = self._split_stream_tts_units(self._stream_tts_buffer, flush=False)
+        self._stream_tts_buffer = remain
+        for unit in units:
+            self._maybe_speak_reply(unit)
+
+    def _spoken_text_from_messages(self, messages):
+        for msg in messages or []:
+            mtype = msg.get('type')
+            if mtype == 'chat':
+                return (msg.get('text') or '').strip()
+            if mtype == 'inspiration':
+                return (
+                    f"今日冲浪见闻。发现：{msg.get('discovery', '')}。"
+                    f"联想：{msg.get('vivy_association', '')}。"
+                    f"{msg.get('invitation_question', '')}"
+                ).strip()
+        return ''
 
     def _clear_option_buttons(self):
         for i in reversed(range(self.options_layout.count())):
@@ -1310,77 +2224,18 @@ class DesktopPet(QWidget):
 
     def _sync_avatar_dock_heights(self):
         extra = 58 if self.chat_mode == "creative" else 0
-        self.avatar_dock.setMinimumHeight(198 + extra)
-        self.avatar_dock.setMaximumHeight(248 + extra)
+        self.avatar_dock.setMinimumHeight(230 + extra)
+        self.avatar_dock.setMaximumHeight(300 + extra)
         self._apply_window_size()
-
-    def _stop_command_effect(self):
-        ce = getattr(self, "_command_effect", None)
-        if ce is not None:
-            ce.stop_effect()
-
-    def _stop_inspiration_effect(self):
-        insp = getattr(self, "_inspiration_effect", None)
-        if insp is not None:
-            insp.stop_effect()
-
-    def _place_command_effect(self):
-        ce = getattr(self, "_command_effect", None)
-        if ce is None:
-            return
-        # 锚在立绘控件头顶正中（非整列 avatar_dock，避免跟底部领域按钮对齐）
-        anchor = self.image_label
-        w, h = self._command_effect_w, self._command_effect_h
-        dx = max(0, (anchor.width() - w) // 2)
-        dy = -h - max(0, self._command_effect_margin_top)
-        ce.follow_master(anchor, dx, dy, w, h)
-
-    def _place_inspiration_effect(self):
-        insp = getattr(self, "_inspiration_effect", None)
-        if insp is None:
-            return
-        anchor = self.image_label
-        w, h = insp.width(), insp.height()
-        if w <= 0 or h <= 0:
-            w, h = self._inspiration_effect_w, self._inspiration_effect_h
-        dx = max(0, (anchor.width() - w) // 2)
-        gap = int(os.getenv("VIVY_FX_STACK_GAP", "8"))
-        ce = getattr(self, "_command_effect", None)
-        if ce is not None and ce.isVisible() and self.chat_mode == "creative":
-            # 创作条贴头顶；灵感条叠在创作条上方（更负的 y），禁止再用正 stack 把条压进立绘
-            hc = ce.height()
-            mc = max(0, self._command_effect_margin_top)
-            dy = -(hc + mc + gap + h)
-        else:
-            dy = -h - max(0, self._inspiration_effect_margin_top)
-        insp.follow_master(anchor, dx, dy, w, h)
-
-    def _reposition_command_effect(self):
-        if self._idle_collapsed:
-            return
-
-        ce = getattr(self, "_command_effect", None)
-        if ce is not None and ce.isVisible() and self.chat_mode == "creative":
-            self._place_command_effect()
-
-        insp = getattr(self, "_inspiration_effect", None)
-        if insp is not None and insp.isVisible():
-            self._place_inspiration_effect()
-
-    def _start_command_effect_if_needed(self):
-        if self.chat_mode != "creative" or self._idle_collapsed:
-            return
-        ce = getattr(self, "_command_effect", None)
-        if ce is None:
-            return
-        self._place_command_effect()
-        ce.start_effect()
 
     def _on_creative_domain_intro_finished(self):
         if self.chat_mode != "creative":
             return
         self.creative_actions.show()
         self.avatar_dock.updateGeometry()
+        if not self._use_button_opacity_fx:
+            QTimer.singleShot(0, self._start_command_effect_if_needed)
+            return
         if getattr(self, "_creative_domain_intro_instant", False):
             for b in self._creative_domain_buttons:
                 eff = b.graphicsEffect()
@@ -1388,6 +2243,7 @@ class DesktopPet(QWidget):
                     eff.setOpacity(1.0)
             QTimer.singleShot(0, self._start_command_effect_if_needed)
             return
+        stagger = 95
         for i, b in enumerate(self._creative_domain_buttons):
             eff = b.graphicsEffect()
             if not isinstance(eff, QGraphicsOpacityEffect):
@@ -1397,7 +2253,7 @@ class DesktopPet(QWidget):
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)
             anim.setEasingCurve(QEasingCurve.Type.OutBack)
-            QTimer.singleShot(50 + i * 95, anim.start)
+            QTimer.singleShot(50 + i * stagger, anim.start)
         QTimer.singleShot(0, self._start_command_effect_if_needed)
 
     def _finish_hide_creative_actions(self):
@@ -1405,6 +2261,9 @@ class DesktopPet(QWidget):
             self.creative_actions.hide()
 
     def _hide_creative_domain_buttons(self, animated: bool):
+        if not self._use_button_opacity_fx:
+            self.creative_actions.hide()
+            return
         if not self.creative_actions.isVisible():
             for b in self._creative_domain_buttons:
                 eff = b.graphicsEffect()
@@ -1448,9 +2307,9 @@ class DesktopPet(QWidget):
         else:
             self.btn_mode.setText("形态：普通")
             self.controls_wrap.setStyleSheet("")
-            self._stop_command_effect()
             self._hide_creative_domain_buttons(animated=mode_changed)
             self.domain_aura.set_creative_active(False, animate=mode_changed)
+            self._stop_command_effect()
             if mode_changed:
                 QTimer.singleShot(430, self._sync_avatar_dock_heights)
             else:
@@ -1487,9 +2346,6 @@ class DesktopPet(QWidget):
 
     def _refresh_memory(self, silent: bool = True):
         self._touch()
-        if not silent:
-            self._set_status_text("正在读取记忆…")
-
         def _request():
             return self._request_get_json(f"/api/memory?user_id={self.user_id}")
 
@@ -1519,13 +2375,14 @@ class DesktopPet(QWidget):
             if not silent:
                 self._set_status_text(f"读取记忆失败：{error_msg}")
 
-        # 与主对话共用 busy 会令「刷新/保存」在思考或流式输出时被 _run_async 直接吞掉；记忆走后台线程即可
-        self._run_background(_request, on_success=_ok, on_error=_err)
+        if silent:
+            # silent refresh should never disable the UI
+            self._run_background(_request, on_success=_ok, on_error=_err)
+        else:
+            self._run_async(_request, _ok, _err, thinking_text="正在读取记忆...")
 
     def _save_memory(self):
         self._touch()
-        self._set_status_text("正在保存记忆…")
-
         def _request():
             import json
             prefs = json.loads((self.memory_prefs.toPlainText() or "{}").strip() or "{}")
@@ -1543,7 +2400,7 @@ class DesktopPet(QWidget):
         def _err(error_msg):
             self._set_status_text(f"保存记忆失败：{error_msg}")
 
-        self._run_background(_request, on_success=_ok, on_error=_err)
+        self._run_async(_request, _ok, _err, thinking_text="正在保存记忆...")
 
     def _show_memory_guide(self):
         self._touch()
@@ -1605,8 +2462,7 @@ class DesktopPet(QWidget):
         def _err(error_msg):
             self._set_status_text(f"删除失败：{error_msg}")
 
-        self._set_status_text("正在删除回合…")
-        self._run_background(_request, on_success=_ok, on_error=_err)
+        self._run_async(_request, _ok, _err, thinking_text="正在删除回合...")
 
     def _set_api_key_interactive(self):
         self._touch()
@@ -1628,142 +2484,6 @@ class DesktopPet(QWidget):
 
         _save_env_value("DEEPSEEK_API_KEY", new_key)
         self._set_status_text("API Key 已保存，后续请求将使用新配置。")
-
-    def _set_cursor_cloud_agent_key_interactive(self):
-        self._touch()
-        current = (os.getenv("CURSOR_API_KEY") or "").strip()
-        key, ok = QInputDialog.getText(
-            self,
-            "Cursor 云 Agent API Key",
-            "在 dashboard → Cloud Agents → API Keys 创建的密钥（通常 key_ 开头）。\n"
-            "将保存到 .env 的 CURSOR_API_KEY（与 DeepSeek 无关）：",
-            QLineEdit.EchoMode.Password,
-            current,
-        )
-        if not ok:
-            return
-        new_key = (key or "").strip()
-        if not new_key:
-            QMessageBox.warning(self, "提示", "密钥不能为空。")
-            return
-        _save_env_value("CURSOR_API_KEY", new_key)
-        self._set_status_text("Cursor 云 Agent 密钥已保存。")
-
-    def _open_cursor_cloud_agent_dialog(self):
-        self._touch()
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Cursor 云 Agent")
-        dlg.resize(500, 400)
-        dlg.setStyleSheet(
-            """
-            QDialog { background-color: #0c141d; color: #eaf8ff; }
-            QLabel { color: #cdeeff; font-size: 12px; }
-            QLineEdit, QTextEdit {
-                background-color: #0a121b;
-                border: 1px solid #46c9ee;
-                border-radius: 8px;
-                color: #f2fbff;
-                padding: 6px;
-                font-size: 12px;
-            }
-            """
-        )
-        hint = QLabel(
-            "在<strong> GitHub 仓库</strong>上启动 Cursor 云 Agent（需控制台 API Key）。\n"
-            "与桌宠日常聊天（DeepSeek）是两套能力；执行时间可能从几十秒到数分钟。"
-        )
-        hint.setWordWrap(True)
-        hint.setTextFormat(Qt.TextFormat.RichText)
-
-        repo = QLineEdit()
-        repo.setPlaceholderText("https://github.com/owner/repo")
-        repo.setText((os.getenv("CURSOR_AGENT_REPO") or "").strip())
-        ref = QLineEdit()
-        ref.setPlaceholderText("main（可留空则使用仓库默认）")
-        ref.setText((os.getenv("CURSOR_AGENT_REF") or "").strip())
-        task = QTextEdit()
-        task.setPlaceholderText("说明要让 Agent 在仓库里完成什么…")
-        task.setMinimumHeight(120)
-
-        form = QFormLayout()
-        form.addRow("仓库 URL", repo)
-        form.addRow("分支 ref", ref)
-        form.addRow("任务说明", task)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(hint)
-        layout.addLayout(form)
-        layout.addWidget(buttons)
-
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        repo_s = repo.text().strip()
-        ref_s = ref.text().strip()
-        task_s = task.toPlainText().strip()
-        if not repo_s or not task_s:
-            QMessageBox.warning(self, "Cursor 云 Agent", "请填写仓库 URL 和任务说明。")
-            return
-
-        api_key = (os.getenv("CURSOR_API_KEY") or "").strip()
-        if not api_key:
-            QMessageBox.warning(
-                self,
-                "Cursor 云 Agent",
-                "请先配置 CURSOR_API_KEY：右键菜单 →「设置 Cursor 云 Agent Key」。",
-            )
-            return
-
-        _save_env_value("CURSOR_AGENT_REPO", repo_s)
-        _save_env_value("CURSOR_AGENT_REF", ref_s)
-
-        def _request():
-            created = launch_agent(
-                api_key,
-                prompt_text=task_s,
-                repository=repo_s,
-                ref=ref_s or None,
-            )
-            aid = str(created.get("id") or "").strip()
-            if not aid:
-                raise RuntimeError(f"启动响应缺少 id：{created!r}")
-            final = wait_agent_terminal(api_key, aid)
-            status = str(final.get("status") or "")
-            conv = get_conversation(api_key, aid)
-            body = format_conversation_text(conv)
-            summary = str(final.get("summary") or "").strip()
-            link = ""
-            tgt = final.get("target")
-            if isinstance(tgt, dict):
-                link = str(tgt.get("url") or "").strip()
-            head_parts = [f"【Cursor 云 Agent】状态：{status}"]
-            if summary:
-                head_parts.append(f"摘要：{summary}")
-            if link:
-                head_parts.append(f"链接：{link}")
-            return {"head": "\n".join(head_parts), "body": body}
-
-        def _ok(data):
-            d = data or {}
-            full = ((d.get("head") or "") + "\n\n" + (d.get("body") or "")).strip()
-            self._set_bubble_text(full, kind="reply")
-            self._set_status_text("Cursor 云 Agent 已结束，见气泡正文。")
-
-        def _err(msg):
-            self._set_status_text(f"云 Agent：{msg}")
-
-        self._run_async(
-            _request,
-            _ok,
-            _err,
-            thinking_text="已提交 Cursor 云 Agent，等待结束（可能数分钟）…",
-        )
 
     def _handle_messages(self, messages):
         if not messages:
@@ -1825,6 +2545,134 @@ class DesktopPet(QWidget):
 
         self._run_async(_request, _ok, _err, thinking_text="VIVY 正在记住你的偏好...")
 
+    def _is_sing_request(self, text: str) -> bool:
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        return any(k in t for k in SING_TRIGGER_KEYWORDS)
+
+
+    def _list_song_files(self) -> list[Path]:
+        if not SONG_DIR.is_dir():
+            return []
+        songs = []
+        for p in SONG_DIR.iterdir():
+            if p.is_file() and p.suffix.lower() in SONG_SUFFIXES:
+                songs.append(p)
+        return songs
+
+
+    def _stop_song(self):
+        try:
+            if self._song_delay_timer.isActive():
+                self._song_delay_timer.stop()
+        except Exception:
+            pass
+
+        self._pending_song_path = None
+
+        try:
+            import winsound
+
+            winsound.PlaySound(None, 0)
+        except Exception:
+            pass
+        self._song_is_playing = False
+        try:
+            self._set_status_text("已停止唱歌。")
+        except Exception:
+            pass
+
+
+    def _estimate_tts_wait_ms(self, text: str) -> int:
+        clean = (text or "").strip()
+        if not clean:
+            return 900
+
+        ms = 850 + len(clean) * 170
+        ms += 350
+        return max(1400, min(ms, 5000))
+
+
+    def _play_pending_song_now(self):
+        song = self._pending_song_path
+        self._pending_song_path = None
+        if not song:
+            return
+
+        try:
+            import winsound
+
+            winsound.PlaySound(str(song.resolve()), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            self._song_is_playing = True
+            self._set_status_text(f"正在播放：{song.name}")
+        except Exception as e:
+            self._song_is_playing = False
+            self._set_status_text(f"播放歌曲失败：{e}")
+            self._set_bubble_text("抱歉，这首歌现在没能顺利播放。请确认歌曲是 WAV 格式。")
+
+
+    def _make_song_intro_text(self, request_text: str) -> str:
+        t = (request_text or "").strip().lower()
+        if any(k in t for k in ("难过", "伤心", "低落", "心情不好", "安慰", "哄我")):
+            return "别急，我在。先听一首歌，好吗？"
+        if any(k in t for k in ("深夜", "晚上", "夜里", "睡不着", "失眠")):
+            return "还没睡吗。那先让我陪你听一首吧。"
+        if any(k in t for k in ("唱歌", "唱首歌", "唱一首", "给我唱", "你唱")):
+            return "我在。那就让我陪你听一首吧。"
+        return "嗯，我陪你听一首。"
+
+
+    def _speak_then_play_song(self, song: Path, intro_text: str):
+        self._set_bubble_text(intro_text)
+        self._set_status_text(f"已选中歌曲：{song.name}")
+
+        if self.auto_voice_reply:
+            self._maybe_speak_reply(intro_text)
+            self._pending_song_path = song
+            wait_ms = self._estimate_tts_wait_ms(intro_text)
+            self._song_delay_timer.start(wait_ms)
+        else:
+            self._pending_song_path = song
+            self._play_pending_song_now()
+
+
+    def _play_random_song(self, request_text: str = "") -> bool:
+        songs = self._list_song_files()
+        if not songs:
+            self._set_bubble_text("我想唱给你听，但当前歌单目录里没有可播放的 WAV 歌曲文件。")
+            self._set_status_text(f"未找到 WAV 歌曲：{SONG_DIR}")
+            return False
+
+        song = random.choice(songs)
+        intro_text = self._make_song_intro_text(request_text)
+
+        try:
+            self._stop_song()
+            self._speak_then_play_song(song, intro_text)
+            return True
+        except Exception as e:
+            self._song_is_playing = False
+            self._set_status_text(f"播放歌曲失败：{e}")
+            self._set_bubble_text("抱歉，这首歌现在没能顺利播放。请确认歌曲是 WAV 格式。")
+            return False
+
+
+    def _try_handle_local_song_request(self, text: str) -> bool:
+        t = (text or "").strip().lower()
+
+        if any(k in t for k in STOP_SONG_TRIGGER_KEYWORDS):
+            self._stop_song()
+            self._set_bubble_text("好，我先停下。")
+            return True
+
+        if not self._is_sing_request(text):
+            return False
+
+        self._play_random_song(text)
+        return True
+
+
     def _send_from_input(self):
         self._touch()
         text = self.input_edit.text().strip()
@@ -1835,20 +2683,10 @@ class DesktopPet(QWidget):
 
     def _send_message(self, text: str):
         self._touch()
-        # 本地直答“现在几点”：避免后端/模型时区导致快一小时
-        t = (text or "").strip()
-        if t and (("几点" in t) or ("现在时间" in t) or (t in ("时间", "几点了", "现在几点"))):
-            try:
-                from datetime import datetime
 
-                now = datetime.now().astimezone()
-                timestr = now.strftime("%H:%M")
-                tz = now.strftime("%Z") or "本地"
-                self._hide_options()
-                self._set_bubble_text(f"现在是 {timestr}（{tz}）。", kind="reply")
-                return
-            except Exception:
-                pass
+        if self._try_handle_local_song_request(text):
+            return
+
         # Commands that require structured messages should use non-stream endpoint.
         lower = (text or "").lower()
         is_structured = ("换个问题" in text) or ("了解我" in text) or ("灵感" in text) or ("冲浪" in lower)
@@ -1869,6 +2707,9 @@ class DesktopPet(QWidget):
             def _ok(data):
                 messages = data.get("messages", [])
                 self._handle_messages(messages)
+                spoken = self._spoken_text_from_messages(messages)
+                if spoken:
+                    self._maybe_speak_reply(spoken)
                 self._refresh_memory(silent=True)
 
             def _err(error_msg):
@@ -1891,6 +2732,7 @@ class DesktopPet(QWidget):
             import json
 
             assembled = ""
+            self._stream_tts_buffer = ""
             for raw in resp.iter_lines(decode_unicode=True):
                 if not raw:
                     continue
@@ -1910,14 +2752,25 @@ class DesktopPet(QWidget):
                 delta = obj.get("delta") or ""
                 if delta:
                     assembled += delta
+                    # 返回“当前累计文本”和“本次增量”，用于 UI 实时刷新和流式播报
                     yield {"partial": assembled, "delta": delta}
 
             return assembled
 
         def _ok_stream(data):
+            reply_text = ((data or {}).get("text") or "").strip()
+            if self.auto_voice_reply:
+                if self.stream_tts_enabled:
+                    units, _remain = self._split_stream_tts_units(self._stream_tts_buffer, flush=True)
+                    self._stream_tts_buffer = ""
+                    for unit in units:
+                        self._maybe_speak_reply(unit)
+                elif reply_text:
+                    self._maybe_speak_reply(reply_text)
             self._refresh_memory(silent=True)
 
         def _err_stream(error_msg):
+            self._stream_tts_buffer = ""
             self._set_status_text(f"请求失败：{error_msg}")
 
         def _consume(progress_callback=None):
@@ -1935,37 +2788,56 @@ class DesktopPet(QWidget):
             _consume,
             _ok_stream,
             _err_stream,
-            on_progress=self._on_stream_chat_progress,
+            on_progress=self._on_stream_tts_progress,
             thinking_text="VIVY 思考中（流式输出）...",
         )
 
     def _touch(self):
-        """刷新「活跃时间」；待机收起时不会自动展开，需双击头像区域唤醒。"""
         self._last_interaction_ts = time.time()
+
+    def _avatar_anchor_global(self) -> QPoint:
+        """取人物图片底部中点作为屏幕锚点。"""
+        if getattr(self, "image_label", None) is None:
+            return self.mapToGlobal(self.rect().center())
+
+        local_pt = QPoint(self.image_label.width() // 2, self.image_label.height())
+        return self.image_label.mapToGlobal(local_pt)
+
+    def _move_window_to_keep_anchor(self, old_anchor: QPoint):
+        """窗口尺寸/布局变化后，校正位置，保持人物锚点不漂移。"""
+        new_anchor = self._avatar_anchor_global()
+        dx = old_anchor.x() - new_anchor.x()
+        dy = old_anchor.y() - new_anchor.y()
+        if dx or dy:
+            self.move(self.x() + dx, self.y() + dy)
 
     def _set_idle_collapsed(self, collapsed: bool):
         if collapsed == self._idle_collapsed:
             return
+
+        old_anchor = self._avatar_anchor_global()
+
         self._idle_collapsed = collapsed
         self.controls_wrap.setVisible(not collapsed)
+
+        # 底部创作领域按钮挂在 avatar_dock 下，不属于 controls_wrap；
+        # 收起时必须额外隐藏，否则会残留在人物外侧。
+        if hasattr(self, "creative_actions"):
+            if collapsed:
+                self.creative_actions.hide()
+            else:
+                if self.chat_mode == "creative":
+                    self.creative_actions.show()
+                else:
+                    self.creative_actions.hide()
 
         if collapsed:
             self.options_wrap.hide()
             self.memory_wrap.hide()
-            # 领域按钮占高一截，与待机小窗的 minHeight 冲突会导致头像被裁；待机时只保留立绘
-            self.creative_actions.hide()
-            self._stop_command_effect()
-            self._stop_inspiration_effect()
-            self.avatar_dock.setMinimumHeight(96)
-            self.avatar_dock.setMaximumHeight(16777215)
-        else:
-            if self.chat_mode == "creative":
-                self.creative_actions.show()
-            else:
-                self.creative_actions.hide()
-            self._sync_avatar_dock_heights()
-            QTimer.singleShot(60, self._start_command_effect_if_needed)
+
         self._apply_window_size()
+        QApplication.processEvents()
+        self._move_window_to_keep_anchor(old_anchor)
 
     def _apply_window_size(self):
         if self._idle_collapsed:
@@ -1974,7 +2846,9 @@ class DesktopPet(QWidget):
             mw = getattr(self, "memory_wrap", None)
             memory_visible = mw is not None and mw.isVisible()
             size = self._expanded_size_with_memory if memory_visible else self._expanded_size
-        self.setFixedSize(size)
+        self.setMinimumSize(size)
+        self.setMaximumSize(size)
+        self.resize(size)
 
     def _start_idle_watch(self):
         self._idle_timer = QTimer(self)
@@ -1993,20 +2867,11 @@ class DesktopPet(QWidget):
             self._set_idle_collapsed(True)
 
     def eventFilter(self, obj, event):
+        # Any key/mouse interaction in input should prevent idle collapse.
         try:
-            if (
-                obj in (self.avatar_dock, self.image_label)
-                and event.type() == QEvent.Type.Resize
-            ):
-                QTimer.singleShot(0, self._reposition_command_effect)
-            if event.type() == QEvent.Type.MouseButtonDblClick:
-                if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
-                    if obj in (self.image_label, self.domain_aura, self.avatar_dock):
-                        self._last_interaction_ts = time.time()
-                        self._set_idle_collapsed(not self._idle_collapsed)
-                        return True
             if obj is self.input_edit:
                 et = event.type()
+                # KeyPress/KeyRelease/MouseButtonPress/FocusIn all imply interaction
                 if et in (
                     event.Type.KeyPress,
                     event.Type.KeyRelease,
@@ -2060,6 +2925,7 @@ class DesktopPet(QWidget):
         act_load_doc = QAction("读取文档（创作辅助）", self)
         act_clear_doc = QAction("清除已读取文档", self)
         act_immersive = QAction("沉浸写作窗口…", self)
+        act_stop_song = QAction("停止唱歌", self)
         act_quit = QAction("退出 VIVY", self)
 
         act_reset.triggered.connect(self._reset_user)
@@ -2072,6 +2938,7 @@ class DesktopPet(QWidget):
         act_load_doc.triggered.connect(self._load_document_for_creative)
         act_clear_doc.triggered.connect(self._clear_loaded_document)
         act_immersive.triggered.connect(self._open_immersive_writing)
+        act_stop_song.triggered.connect(lambda: (self._stop_song(), self._set_bubble_text("好，我先停下。")))
         act_quit.triggered.connect(QApplication.instance().quit)
 
         menu.addAction(act_reset)
@@ -2085,6 +2952,7 @@ class DesktopPet(QWidget):
         menu.addAction(act_load_doc)
         menu.addAction(act_clear_doc)
         menu.addAction(act_immersive)
+        menu.addAction(act_stop_song)
         menu.addSeparator()
         menu.addAction(act_quit)
         menu.exec(event.globalPos())
@@ -2096,65 +2964,17 @@ class DesktopPet(QWidget):
 
     def _set_idle_timeout_interactive(self):
         self._touch()
-        dlg = QInputDialog(self)
-        dlg.setInputMode(QInputDialog.InputMode.IntInput)
-        dlg.setWindowTitle("设置待机时长")
-        dlg.setLabelText("多少秒不操作后进入待机：")
-        dlg.setIntValue(int(self._idle_timeout_s))
-        dlg.setIntMinimum(5)
-        dlg.setIntMaximum(3600)
-        dlg.setIntStep(1)
-        dlg.setStyleSheet(
-            """
-            QInputDialog {
-                background-color: #0c141d;
-            }
-            QLabel {
-                color: #eaf8ff;
-                font-size: 13px;
-                font-weight: 500;
-            }
-            QSpinBox {
-                color: #04131c;
-                background-color: #dff6ff;
-                border: 2px solid #46c9ee;
-                border-radius: 8px;
-                padding: 6px 10px;
-                font-size: 15px;
-                font-weight: 600;
-                min-height: 28px;
-                selection-background-color: rgba(55, 214, 255, 160);
-                selection-color: #04131c;
-            }
-            QSpinBox:focus {
-                border: 2px solid #7be2ff;
-            }
-            QSpinBox::up-button, QSpinBox::down-button {
-                width: 22px;
-                background: #2b9ec5;
-                border-left: 1px solid #46c9ee;
-            }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                background: #3ab8de;
-            }
-            QPushButton {
-                background-color: #2b9ec5;
-                border: 1px solid #7be2ff;
-                border-radius: 8px;
-                color: #04131c;
-                padding: 6px 16px;
-                font-size: 13px;
-                font-weight: 600;
-                min-width: 72px;
-            }
-            QPushButton:hover {
-                background-color: #3ab8de;
-            }
-            """
+        value, ok = QInputDialog.getInt(
+            self,
+            "设置待机时长",
+            "多少秒不操作后进入待机：",
+            int(self._idle_timeout_s),
+            5,
+            3600,
+            1,
         )
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        if not ok:
             return
-        value = dlg.intValue()
 
         self._idle_timeout_s = int(value)
         _save_env_value("VIVY_IDLE_TIMEOUT", str(self._idle_timeout_s))
@@ -2182,15 +3002,6 @@ class DesktopPet(QWidget):
             return
 
         self._start_creative_doc_stream(path, (goal or "").strip())
-
-    def _open_immersive_writing(self):
-        self._touch()
-        if self._immersive_writing_window is None:
-            self._immersive_writing_window = ImmersiveWritingWindow(self)
-            self._immersive_writing_window.set_assist_busy(self._busy)
-        self._immersive_writing_window.show()
-        self._immersive_writing_window.raise_()
-        self._immersive_writing_window.activateWindow()
 
     def _start_creative_doc_stream(self, path: str, goal: str = ""):
         """菜单「读取文档」与创作形态下拖放共用：流式调用 creative_doc_stream。"""
@@ -2258,6 +3069,14 @@ class DesktopPet(QWidget):
         self._loaded_doc_path = None
         self._set_status_text("已清除已读取文档。")
 
+    def _open_immersive_writing(self):
+        self._touch()
+        if self._immersive_writing_window is None:
+            self._immersive_writing_window = ImmersiveWritingWindow(self)
+        self._immersive_writing_window.show()
+        self._immersive_writing_window.raise_()
+        self._immersive_writing_window.activateWindow()
+
     def _reset_user(self):
         self._touch()
         self.user_id = str(uuid.uuid4())
@@ -2266,24 +3085,55 @@ class DesktopPet(QWidget):
         QTimer.singleShot(300, self._init_session)
 
     def mousePressEvent(self, event: QMouseEvent):
-        self._touch()
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._drag_started_while_collapsed = bool(self._idle_collapsed)
+            self._last_interaction_ts = time.time()
             event.accept()
+            return
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        self._touch()
         if self._dragging and event.buttons() & Qt.MouseButton.LeftButton:
             new_pos = event.globalPosition().toPoint() - self._drag_offset
             self.move(new_pos)
+            self._last_interaction_ts = time.time()
             event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        try:
+            if getattr(self, "_command_effect", None) is not None and self.chat_mode == "creative":
+                self._play_overlay_effect(
+                    self._command_effect,
+                    "创作模式",
+                    self._command_effect_w,
+                    self._command_effect_h,
+                    self._command_effect_margin_top,
+                )
+            if getattr(self, "_inspiration_effect", None) is not None and self._inspiration_effect.isVisible():
+                self._show_overlay_text_static(
+                    self._inspiration_effect,
+                    getattr(self, "_last_inspiration_overlay_text", ""),
+                    self._inspiration_effect_w,
+                    self._inspiration_effect_h,
+                    self._inspiration_effect_margin_top,
+                    stack_above_command=(self.chat_mode == "creative"),
+                )
+        except Exception:
+            pass
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        self._touch()
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
+            self._last_interaction_ts = time.time()
+            self._drag_started_while_collapsed = False
             event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2297,14 +3147,7 @@ class DesktopPet(QWidget):
 def run_flask_background(port: int):
     def _target():
         init_db()
-        # threaded=True：避免单请求（如长时间流式 chat）独占本机服务，导致记忆 API 无法响应
-        flask_app.run(
-            host="127.0.0.1",
-            port=port,
-            debug=False,
-            use_reloader=False,
-            threaded=True,
-        )
+        flask_app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()

@@ -9,7 +9,6 @@ from typing import Optional
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PyQt6.QtWidgets import (
-    QGraphicsDropShadowEffect,
     QLabel,
     QSizePolicy,
     QVBoxLayout,
@@ -60,9 +59,9 @@ class CommandEffect(QWidget):
 
     @staticmethod
     def _make_pixel_font() -> QFont:
-        """尽量点阵：优先 Fixedsys/-terminal，否则新宋体 12px 等宽块面感。"""
-        chosen = QFont("SimSun")
-        for name in ("Fixedsys", "Terminal", "NSimSun", "SimSun", "Courier New"):
+        """尽量保留点阵/终端感，但避开 Windows 上容易告警的 Fixedsys。"""
+        chosen = QFont("Microsoft YaHei UI")
+        for name in ("Microsoft YaHei UI", "NSimSun", "SimSun", "Consolas", "Courier New"):
             f = QFont(name)
             if f.exactMatch():
                 chosen = f
@@ -78,9 +77,10 @@ class CommandEffect(QWidget):
         chosen.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.5)
         return chosen
 
-    def __init__(self, parent: Optional[QWidget] = None, target_text: str = "创作模式"):
+    def __init__(self, parent: Optional[QWidget] = None, target_text: str = "创作模式", scramble: bool = True):
         super().__init__(parent)
         self._target = target_text or "创作模式"
+        self._scramble = bool(scramble)
         self._locked = 0
         self._tick_count = 0
         self._ticks_per_lock = 3
@@ -107,22 +107,21 @@ class CommandEffect(QWidget):
 
         self._label.setFont(self._make_pixel_font())
 
-        glow = QGraphicsDropShadowEffect(self)
-        glow.setBlurRadius(14)
-        glow.setColor(QColor(210, 215, 225, 70))
-        glow.setOffset(0, 0)
-        self.setGraphicsEffect(glow)
+        # 稳定版：优先作为主窗内部浮层使用，避免“第二个透明顶层窗”导致 layered window 更新失败。
+        if parent is None:
+            self.setWindowFlags(
+                Qt.WindowType.Tool
+                | Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.WindowDoesNotAcceptFocus
+            )
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        else:
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.SubWindow)
 
-        self.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.WindowDoesNotAcceptFocus
-        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        # 顶层透明窗下，Qt 可能不绘制 QWidget 样式表背景/边框；强制启用样式背景更稳
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
         self._apply_style()
 
@@ -137,6 +136,10 @@ class CommandEffect(QWidget):
             fw = max(2, min(W, H) // 5)
         hi = QColor(*self._BEZEL_HI, 255)
         lo = QColor(*self._BEZEL_LO, 255)
+        # 用手绘淡辉光替代 QGraphicsDropShadowEffect，减少透明分层窗口报错。
+        for i, alpha in ((3, 16), (2, 28), (1, 44)):
+            p.fillRect(i, i, max(0, W - i * 2), 1, QColor(190, 205, 226, alpha))
+            p.fillRect(i, max(0, H - i - 1), max(0, W - i * 2), 1, QColor(90, 100, 120, alpha))
         # 上亮下暗的塑料壳
         p.fillRect(0, 0, W, fw, hi)
         p.fillRect(0, 0, fw, H, hi)
@@ -170,7 +173,6 @@ class CommandEffect(QWidget):
                 color: {t};
                 background: transparent;
                 padding: 1px 3px;
-                text-shadow: 0 0 1px rgba(100, 160, 220, 0.35);
             }}
             """
         )
@@ -190,6 +192,8 @@ class CommandEffect(QWidget):
         n = len(t)
         if n == 0:
             return ""
+        if not self._scramble:
+            return t
         parts: list[str] = []
         for i, ch in enumerate(t):
             if i < self._locked:
@@ -247,6 +251,11 @@ class CommandEffect(QWidget):
 
     def set_offset_from_master(self, master: QWidget, dx: int, dy: int) -> None:
         top_left = master.mapToGlobal(QPoint(0, 0))
+        parent = self.parentWidget()
+        if parent is not None:
+            local = parent.mapFromGlobal(top_left)
+            self.move(local.x() + dx, local.y() + dy)
+            return
         self.move(top_left.x() + dx, top_left.y() + dy)
 
     def follow_master(self, master: QWidget, dx: int, dy: int, w: int, h: int) -> None:
@@ -257,8 +266,11 @@ class CommandEffect(QWidget):
         self._locked = 0
         self._tick_count = 0
         self._label.setText(self._build_line())
-        self._timer.setInterval(random.randint(60, 90))
-        self._timer.start()
+        if self._scramble:
+            self._timer.setInterval(random.randint(60, 90))
+            self._timer.start()
+        else:
+            self._timer.stop()
         self._scan_timer.start()
         self.show()
         self.raise_()
