@@ -3,6 +3,18 @@ import requests
 import json
 
 
+def _make_session_no_proxy() -> requests.Session:
+    """
+    Force requests to ignore system/environment proxy settings.
+    This avoids issues like ProxyError/SSLEOFError when a local proxy (e.g. 127.0.0.1:7890)
+    is enabled but cannot reach the upstream API.
+    """
+    s = requests.Session()
+    # Critical: do NOT read HTTP(S)_PROXY / Windows system proxy.
+    s.trust_env = False
+    return s
+
+
 def deepseek_chat(messages, model=None, temperature=0.7, max_tokens=800, base_url=None, api_key=None, timeout=60):
     """调用 DeepSeek 的 chat/completions 接口。
 
@@ -28,15 +40,17 @@ def deepseek_chat(messages, model=None, temperature=0.7, max_tokens=800, base_ur
         "Content-Type": "application/json",
     }
 
+    session = _make_session_no_proxy()
+
     # 尝试 1：Bearer 方式
     headers["Authorization"] = f"Bearer {api_key}"
-    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    resp = session.post(url, headers=headers, json=payload, timeout=timeout)
 
     if resp.status_code != 200:
         # 尝试 2：直接 token 方式（部分网关会用这种）
         if resp.status_code in (401, 403):
             headers["Authorization"] = api_key
-            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            resp = session.post(url, headers=headers, json=payload, timeout=timeout)
 
     resp.raise_for_status()
 
@@ -80,10 +94,11 @@ def deepseek_chat_stream(
     }
 
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-    resp = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=True)
+    session = _make_session_no_proxy()
+    resp = session.post(url, headers=headers, json=payload, timeout=timeout, stream=True)
     if resp.status_code != 200 and resp.status_code in (401, 403):
         headers["Authorization"] = api_key
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=True)
+        resp = session.post(url, headers=headers, json=payload, timeout=timeout, stream=True)
 
     resp.raise_for_status()
 

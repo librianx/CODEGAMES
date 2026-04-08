@@ -7,6 +7,7 @@ import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 import json
+import base64
 
 from flask import Flask, jsonify, request, Response, stream_with_context
 from dotenv import load_dotenv
@@ -428,6 +429,7 @@ def _chat_with_llm(
     user_message: str,
     interest_signal: Optional[str] = None,
     chat_mode: Optional[str] = None,
+    image_data_url: Optional[str] = None,
 ) -> str:
     row = get_user(user_id)
     prefs = parse_preferences(row) if row is not None else {}
@@ -464,10 +466,22 @@ def _chat_with_llm(
         ),
     )
 
-    messages = [
-        {"role": "system", "content": VIVY_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ]
+    if image_data_url:
+        messages = [
+            {"role": "system", "content": VIVY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            },
+        ]
+    else:
+        messages = [
+            {"role": "system", "content": VIVY_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
 
     effective_mode = (chat_mode or prefs.get("chat_mode") or "chat").strip().lower()
     if effective_mode not in ("chat", "creative"):
@@ -483,14 +497,68 @@ def _chat_with_llm(
         max_tokens = int(os.getenv("VIVY_CHAT_MAX_TOKENS", "220" if _fast_mode_enabled() else "500"))
         temperature = float(os.getenv("VIVY_CHAT_TEMPERATURE", "0.6" if _fast_mode_enabled() else "0.8"))
         timeout = int(os.getenv("VIVY_CHAT_TIMEOUT", "25" if _fast_mode_enabled() else "60"))
+    model = None
+    if image_data_url:
+        model = (os.getenv("DEEPSEEK_VISION_MODEL") or "").strip() or None
+
     try:
-        return deepseek_chat(messages=messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+        return deepseek_chat(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
     except Exception:
         # 兜底：保持 VIVY 口语科幻风格与温暖情绪
+        if image_data_url:
+            return "我收到图片了，但我现在接入的模型/接口可能不支持看图。你可以在 .env 里配置 `DEEPSEEK_VISION_MODEL`（或换成支持图像的 OpenAI 兼容模型）再试一次。"
         return (
             "在我的时间线里，你的这句话就是一个小触发器。"
             "虽然我现在版本很低，我还是能帮你把“下一步”拆成能马上开始的粒度。"
         )
+
+
+def _normalize_image_payload_to_data_url(image_obj: Any) -> Optional[str]:
+    """
+    Accepts either:
+      - {"data": "<base64>", "mime": "image/png"}  (preferred)
+      - {"data_url": "data:image/png;base64,..."} (also ok)
+    Returns a data: URL string or None.
+    """
+    if not image_obj:
+        return None
+    if not isinstance(image_obj, dict):
+        return None
+
+    data_url = (image_obj.get("data_url") or "").strip()
+    if data_url:
+        if not data_url.startswith("data:image/"):
+            return None
+        # basic size guard (data url is bigger than bytes)
+        max_bytes = int(os.getenv("VIVY_IMAGE_MAX_BYTES", "3000000"))
+        if len(data_url) > max_bytes * 2.2:
+            return None
+        return data_url
+
+    b64 = (image_obj.get("data") or "").strip()
+    mime = (image_obj.get("mime") or "").strip().lower()
+    if not b64 or not mime.startswith("image/"):
+        return None
+
+    max_bytes = int(os.getenv("VIVY_IMAGE_MAX_BYTES", "3000000"))
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    if len(raw) > max_bytes:
+        return None
+
+    # Re-encode to normalize (avoid non-canonical input)
+    normalized = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{normalized}"
 
 
 def _chat_with_llm_stream(
@@ -778,6 +846,7 @@ def api_message():
     message = (data.get("message") or "").strip()
     interest_signal = (data.get("interest_signal") or "").strip().lower()
     chat_mode = (data.get("chat_mode") or "").strip().lower()
+    image_data_url = _normalize_image_payload_to_data_url(data.get("image"))
 
     if not user_id or not message:
         return _json_response({"error": "missing params"}, 400)
@@ -858,7 +927,13 @@ def api_message():
         return _json_response({"user_id": user_id, "messages": messages})
 
     # 4) 默认：普通对话
-    chat_text = _chat_with_llm(user_id, message, interest_signal=interest_signal, chat_mode=chat_mode or None)
+    chat_text = _chat_with_llm(
+        user_id,
+        message,
+        interest_signal=interest_signal,
+        chat_mode=chat_mode or None,
+        image_data_url=image_data_url,
+    )
     messages.append({"type": "chat", "text": chat_text})
     _record_assistant_text(user_id, chat_text, chat_mode)
     log_interaction(user_id, topic="对话", sentiment="neutral", content=message[:200])

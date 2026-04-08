@@ -6,6 +6,8 @@ import threading
 import time
 import math
 import random
+import base64
+import mimetypes
 from pathlib import Path
 import inspect
 
@@ -77,19 +79,6 @@ from app import app as flask_app
 from db import init_db
 from creative_assist import OFFICE_CONTEXT_MAX, OFFICE_PASSAGE_MAX, load_document_text
 from speech import recognize_once, speak_text_async
-
-try:
-    from cursor_agent_api import (
-        format_conversation_text,
-        get_conversation,
-        launch_agent,
-        wait_agent_terminal,
-    )
-except Exception:
-    format_conversation_text = None
-    get_conversation = None
-    launch_agent = None
-    wait_agent_terminal = None
 
 try:
     from command_effect_stable import CommandEffect
@@ -1318,6 +1307,15 @@ class DesktopPet(QWidget):
         self._inspiration_effect_margin_top = int(os.getenv("VIVY_INSP_FX_MARGIN_TOP", "14"))
         self._last_inspiration_overlay_text = ""
 
+        # Overlay effects should never block UI interactions (e.g. memory panel).
+        for _eff in (self._command_effect, self._inspiration_effect):
+            if _eff is None:
+                continue
+            try:
+                _eff.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            except Exception:
+                pass
+
         # quick actions
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
@@ -1346,16 +1344,30 @@ class DesktopPet(QWidget):
         input_row = QHBoxLayout()
         input_row.setSpacing(6)
 
-        self.input_edit = QLineEdit()
+        self.input_edit = QPlainTextEdit()
         self.input_edit.setPlaceholderText("和 VIVY 说点什么...")
-        self.input_edit.returnPressed.connect(self._send_from_input)
         # typing/focus should count as interaction (prevent idle collapse while composing)
-        self.input_edit.textEdited.connect(lambda _t: self._touch())
-        self.input_edit.cursorPositionChanged.connect(lambda _a, _b: self._touch())
+        self.input_edit.textChanged.connect(lambda: self._touch())
+        self.input_edit.cursorPositionChanged.connect(lambda: self._touch())
         self.input_edit.selectionChanged.connect(lambda: self._touch())
         self.input_edit.installEventFilter(self)
         self.input_edit.setAcceptDrops(False)
-        input_row.addWidget(self.input_edit)
+        self.input_edit.setMinimumHeight(46)
+        self.input_edit.setMaximumHeight(86)
+        input_row.addWidget(self.input_edit, 1)
+
+        # image attach (vision)
+        self._chat_image_path = None
+        self.btn_image = QPushButton("🖼")
+        self.btn_image.setToolTip("选择一张图片，让 VIVY 识别/理解（发送时将走非流式）")
+        self.btn_image.clicked.connect(self._pick_chat_image)
+        input_row.addWidget(self.btn_image)
+
+        self.btn_image_clear = QPushButton("✖")
+        self.btn_image_clear.setToolTip("清除已选择的图片")
+        self.btn_image_clear.clicked.connect(self._clear_chat_image)
+        self.btn_image_clear.setEnabled(False)
+        input_row.addWidget(self.btn_image_clear)
 
         self.btn_send = QPushButton("发送")
         self.btn_send.clicked.connect(self._send_from_input)
@@ -1369,8 +1381,6 @@ class DesktopPet(QWidget):
         self.btn_voice_toggle.clicked.connect(self._toggle_auto_voice_reply)
         input_row.addWidget(self.btn_voice_toggle)
         self._update_voice_toggle_button()
-
-        self.controls_layout.addLayout(input_row)
 
         interest_row = QHBoxLayout()
         interest_row.setSpacing(6)
@@ -1389,6 +1399,10 @@ class DesktopPet(QWidget):
         self.btn_interest_clear.clicked.connect(lambda: self._set_interest_signal(""))
         interest_row.addWidget(self.btn_interest_clear)
         self.controls_layout.addLayout(interest_row)
+
+        # Keep the input box at the bottom of the chat area.
+        self.controls_layout.addStretch(1)
+        self.controls_layout.addLayout(input_row)
 
         self.memory_wrap = QFrame()
         self.memory_wrap.setObjectName("memoryWrap")
@@ -1491,7 +1505,7 @@ class DesktopPet(QWidget):
                 line-height: 1.35;
                 selection-background-color: rgba(55, 214, 255, 140);
             }
-            QLineEdit {
+            QLineEdit, QPlainTextEdit {
                 background: rgba(10, 18, 26, 200);
                 border: 1px solid rgba(78, 208, 255, 130);
                 border-radius: 8px;
@@ -1853,130 +1867,6 @@ class DesktopPet(QWidget):
         # 统一走后端结构化灵感接口，保持“【今日冲浪见闻】发现/联想/邀请”样式。
         self._send_message("今天有什么灵感")
 
-    def _set_cursor_cloud_agent_key_interactive(self):
-        self._touch()
-        current = (os.getenv("CURSOR_API_KEY") or "").strip()
-        key, ok = QInputDialog.getText(
-            self,
-            "Cursor 云 Agent API Key",
-            "请输入 Cursor 云 Agent 的 API Key（会保存到 .env 的 CURSOR_API_KEY）：",
-            QLineEdit.EchoMode.Password,
-            current,
-        )
-        if not ok:
-            return
-        new_key = (key or "").strip()
-        if not new_key:
-            QMessageBox.warning(self, "提示", "密钥不能为空。")
-            return
-        _save_env_value("CURSOR_API_KEY", new_key)
-        self._set_status_text("Cursor 云 Agent 密钥已保存。")
-
-    def _open_cursor_cloud_agent_dialog(self):
-        self._touch()
-        if not all([launch_agent, wait_agent_terminal, get_conversation, format_conversation_text]):
-            QMessageBox.information(self, "Cursor 云 Agent", "当前项目缺少 cursor_agent_api 相关模块，暂时无法启用。")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Cursor 云 Agent")
-        dlg.resize(520, 400)
-
-        hint = QLabel(
-            "在 GitHub 仓库上启动 Cursor 云 Agent。\n"
-            "这和桌宠日常聊天是两套能力，执行可能需要一段时间。"
-        )
-        hint.setWordWrap(True)
-
-        repo = QLineEdit()
-        repo.setPlaceholderText("https://github.com/owner/repo")
-        repo.setText((os.getenv("CURSOR_AGENT_REPO") or "").strip())
-
-        ref = QLineEdit()
-        ref.setPlaceholderText("main（可留空）")
-        ref.setText((os.getenv("CURSOR_AGENT_REF") or "").strip())
-
-        task = QTextEdit()
-        task.setPlaceholderText("说明要让 Agent 在仓库里完成什么…")
-        task.setMinimumHeight(120)
-
-        form = QFormLayout()
-        form.addRow("仓库 URL", repo)
-        form.addRow("分支 ref", ref)
-        form.addRow("任务说明", task)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(hint)
-        layout.addLayout(form)
-        layout.addWidget(buttons)
-
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        repo_s = repo.text().strip()
-        ref_s = ref.text().strip()
-        task_s = task.toPlainText().strip()
-        if not repo_s or not task_s:
-            QMessageBox.warning(self, "Cursor 云 Agent", "请填写仓库 URL 和任务说明。")
-            return
-
-        api_key = (os.getenv("CURSOR_API_KEY") or "").strip()
-        if not api_key:
-            QMessageBox.warning(self, "Cursor 云 Agent", "请先配置 CURSOR_API_KEY。")
-            return
-
-        _save_env_value("CURSOR_AGENT_REPO", repo_s)
-        _save_env_value("CURSOR_AGENT_REF", ref_s)
-
-        def _request():
-            created = launch_agent(
-                api_key,
-                prompt_text=task_s,
-                repository=repo_s,
-                ref=ref_s or None,
-            )
-            aid = str(created.get("id") or "").strip()
-            if not aid:
-                raise RuntimeError(f"启动响应缺少 id：{created!r}")
-            final = wait_agent_terminal(api_key, aid)
-            status = str(final.get("status") or "")
-            conv = get_conversation(api_key, aid)
-            body = format_conversation_text(conv)
-            summary = str(final.get("summary") or "").strip()
-            link = ""
-            tgt = final.get("target")
-            if isinstance(tgt, dict):
-                link = str(tgt.get("url") or "").strip()
-            head_parts = [f"【Cursor 云 Agent】状态：{status}"]
-            if summary:
-                head_parts.append(f"摘要：{summary}")
-            if link:
-                head_parts.append(f"链接：{link}")
-            return {"head": "\n".join(head_parts), "body": body}
-
-        def _ok(data):
-            d = data or {}
-            full = ((d.get("head") or "") + "\n\n" + (d.get("body") or "")).strip()
-            self._set_bubble_text(full, kind="reply")
-            self._maybe_speak_reply(d.get("summary") or d.get("head") or "")
-            self._set_status_text("Cursor 云 Agent 已结束，见气泡正文。")
-
-        def _err(msg):
-            self._set_status_text(f"云 Agent：{msg}")
-
-        self._run_async(
-            _request,
-            _ok,
-            _err,
-            thinking_text="已提交 Cursor 云 Agent，等待结束（可能较久）…",
-        )
-
     def _copy_latest_reply(self):
         text = self.bubble_text.textCursor().selectedText().strip() or self.latest_reply
         if text:
@@ -2008,7 +1898,7 @@ class DesktopPet(QWidget):
             if not text:
                 self._set_status_text('没有识别到有效文字。')
                 return
-            self.input_edit.setText(text)
+            self.input_edit.setPlainText(text)
             self.input_edit.setFocus()
             self._send_from_input()
 
@@ -2404,23 +2294,47 @@ class DesktopPet(QWidget):
 
     def _show_memory_guide(self):
         self._touch()
-        QMessageBox.information(
-            self,
-            "记忆模块操作指南",
-            (
-                "最简单的使用流程：\n\n"
-                "1) 点击“刷新记忆”\n"
-                "   先拉取数据库里的最新内容，避免覆盖旧数据。\n\n"
-                "2) 按需修改\n"
-                "   - summary：写 1 句最近状态\n"
-                "   - summary_long：写长期偏好/目标/边界\n"
-                "   - preferences JSON：必须保持合法 JSON\n\n"
-                "3) 点击“保存记忆”\n"
-                "   保存后 VIVY 后续对话会按新记忆工作。\n\n"
-                "4) 管理历史回合\n"
-                "   在“最近对话回合”里看 [ID]，输入 ID 后点“删除回合”。"
-            ),
+        text = (
+            "最简单的使用流程：\n\n"
+            "1) 点击“刷新记忆”\n"
+            "   先拉取数据库里的最新内容，避免覆盖旧数据。\n\n"
+            "2) 按需修改\n"
+            "   - summary：写 1 句最近状态\n"
+            "   - summary_long：写长期偏好/目标/边界\n"
+            "   - preferences JSON：必须保持合法 JSON\n\n"
+            "3) 点击“保存记忆”\n"
+            "   保存后 VIVY 后续对话会按新记忆工作。\n\n"
+            "4) 管理历史回合\n"
+            "   在“最近对话回合”里看 [ID]，输入 ID 后点“删除回合”。"
         )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("记忆模块操作指南")
+        box.setText(text)
+        # On translucent/dark UI, the default QMessageBox theme can make text unreadable.
+        box.setStyleSheet(
+            """
+            QMessageBox {
+                background: rgba(10, 18, 26, 245);
+                color: #eaf8ff;
+            }
+            QMessageBox QLabel {
+                color: #eaf8ff;
+                font-size: 12px;
+            }
+            QMessageBox QPushButton {
+                background: rgba(39, 160, 209, 210);
+                border: 1px solid rgba(121, 228, 255, 180);
+                border-radius: 8px;
+                padding: 5px 10px;
+                color: #f3fcff;
+            }
+            QMessageBox QPushButton:hover {
+                background: rgba(57, 186, 241, 230);
+            }
+            """
+        )
+        box.exec()
 
     def _apply_memory_json_template(self):
         self._touch()
@@ -2675,11 +2589,71 @@ class DesktopPet(QWidget):
 
     def _send_from_input(self):
         self._touch()
-        text = self.input_edit.text().strip()
+        text = (self.input_edit.toPlainText() or "").strip()
         if not text:
             return
-        self.input_edit.clear()
+        self.input_edit.setPlainText("")
         self._send_message(text)
+
+    def _pick_chat_image(self):
+        self._touch()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择图片",
+            "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;All Files (*)",
+        )
+        if not path:
+            return
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            self._set_status_text("选择图片失败：文件不存在。")
+            return
+        max_bytes = int(os.getenv("VIVY_IMAGE_MAX_BYTES", "3000000"))
+        try:
+            size = p.stat().st_size
+        except Exception:
+            size = 0
+        if size and size > max_bytes:
+            self._set_status_text(f"图片太大：{size} bytes（上限 {max_bytes}）。")
+            return
+
+        self._chat_image_path = str(p)
+        self.btn_image.setText("🖼✓")
+        self.btn_image_clear.setEnabled(True)
+        self._set_status_text(f"已选择图片：{p.name}")
+
+    def _clear_chat_image(self, silent: bool = False):
+        self._chat_image_path = None
+        if hasattr(self, "btn_image"):
+            self.btn_image.setText("🖼")
+        if hasattr(self, "btn_image_clear"):
+            self.btn_image_clear.setEnabled(False)
+        if not silent:
+            self._set_status_text("已清除图片。")
+
+    def _build_chat_image_payload(self) -> dict | None:
+        path = getattr(self, "_chat_image_path", None)
+        if not path:
+            return None
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return None
+
+        max_bytes = int(os.getenv("VIVY_IMAGE_MAX_BYTES", "3000000"))
+        try:
+            raw = p.read_bytes()
+        except Exception:
+            return None
+        if not raw or len(raw) > max_bytes:
+            return None
+
+        mime, _enc = mimetypes.guess_type(str(p))
+        mime = (mime or "image/png").lower()
+        if not mime.startswith("image/"):
+            mime = "image/png"
+        b64 = base64.b64encode(raw).decode("ascii")
+        return {"data": b64, "mime": mime}
 
     def _send_message(self, text: str):
         self._touch()
@@ -2689,18 +2663,24 @@ class DesktopPet(QWidget):
 
         # Commands that require structured messages should use non-stream endpoint.
         lower = (text or "").lower()
-        is_structured = ("换个问题" in text) or ("了解我" in text) or ("灵感" in text) or ("冲浪" in lower)
+        has_image = bool(getattr(self, "_chat_image_path", None))
+        is_structured = has_image or ("换个问题" in text) or ("了解我" in text) or ("灵感" in text) or ("冲浪" in lower)
 
         if is_structured:
             def _request():
+                payload = {
+                    "user_id": self.user_id,
+                    "message": text,
+                    "interest_signal": self.current_interest_signal or None,
+                    "chat_mode": self.chat_mode,
+                }
+                if has_image:
+                    img_payload = self._build_chat_image_payload()
+                    if img_payload:
+                        payload["image"] = img_payload
                 return self._request_json(
                     "/api/message",
-                    {
-                        "user_id": self.user_id,
-                        "message": text,
-                        "interest_signal": self.current_interest_signal or None,
-                        "chat_mode": self.chat_mode,
-                    },
+                    payload,
                     timeout=25,
                 )
 
@@ -2711,6 +2691,8 @@ class DesktopPet(QWidget):
                 if spoken:
                     self._maybe_speak_reply(spoken)
                 self._refresh_memory(silent=True)
+                if has_image:
+                    self._clear_chat_image(silent=True)
 
             def _err(error_msg):
                 self._set_status_text(f"请求失败：{error_msg}")
@@ -2871,6 +2853,18 @@ class DesktopPet(QWidget):
         try:
             if obj is self.input_edit:
                 et = event.type()
+                # Enter to send, Shift+Enter to newline (for multiline input).
+                if et == event.Type.KeyPress:
+                    try:
+                        key = event.key()
+                        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                            mods = event.modifiers()
+                            if mods & Qt.KeyboardModifier.ShiftModifier:
+                                return False  # allow newline
+                            self._send_from_input()
+                            return True  # consume
+                    except Exception:
+                        pass
                 # KeyPress/KeyRelease/MouseButtonPress/FocusIn all imply interaction
                 if et in (
                     event.Type.KeyPress,
@@ -2917,8 +2911,6 @@ class DesktopPet(QWidget):
         )
         act_reset = QAction("重置本机用户ID", self)
         act_set_api_key = QAction("设置 API Key", self)
-        act_set_cursor_key = QAction("设置 Cursor 云 Agent Key", self)
-        act_cursor_agent = QAction("运行 Cursor 云 Agent…", self)
         act_toggle_memory = QAction("显示/隐藏记忆模块", self)
         act_toggle_idle = QAction("切换待机收起", self)
         act_set_idle_timeout = QAction("设置待机时长", self)
@@ -2930,8 +2922,6 @@ class DesktopPet(QWidget):
 
         act_reset.triggered.connect(self._reset_user)
         act_set_api_key.triggered.connect(self._set_api_key_interactive)
-        act_set_cursor_key.triggered.connect(self._set_cursor_cloud_agent_key_interactive)
-        act_cursor_agent.triggered.connect(self._open_cursor_cloud_agent_dialog)
         act_toggle_memory.triggered.connect(self._toggle_memory_panel)
         act_toggle_idle.triggered.connect(lambda: self._set_idle_collapsed(not self._idle_collapsed))
         act_set_idle_timeout.triggered.connect(self._set_idle_timeout_interactive)
@@ -2943,8 +2933,6 @@ class DesktopPet(QWidget):
 
         menu.addAction(act_reset)
         menu.addAction(act_set_api_key)
-        menu.addAction(act_set_cursor_key)
-        menu.addAction(act_cursor_agent)
         menu.addAction(act_toggle_memory)
         menu.addAction(act_toggle_idle)
         menu.addAction(act_set_idle_timeout)
@@ -2961,6 +2949,7 @@ class DesktopPet(QWidget):
         self.memory_wrap.setVisible(not self.memory_wrap.isVisible())
         # Keep main panel size stable regardless of memory panel visibility.
         self._apply_window_size()
+
 
     def _set_idle_timeout_interactive(self):
         self._touch()
@@ -2979,6 +2968,7 @@ class DesktopPet(QWidget):
         self._idle_timeout_s = int(value)
         _save_env_value("VIVY_IDLE_TIMEOUT", str(self._idle_timeout_s))
         self._set_status_text(f"待机时长已设置为 {self._idle_timeout_s} 秒。")
+
 
     def _load_document_for_creative(self):
         self._touch()
