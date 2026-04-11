@@ -1,4 +1,4 @@
-
+﻿
 import base64
 import io
 import os
@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -32,6 +33,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "y", "on")
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = _env(name, str(default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _powershell_exe() -> str:
     return _env("VIVY_POWERSHELL_EXE", "powershell")
 
@@ -42,88 +51,84 @@ def _run_powershell(script: str, timeout: int = 30) -> str:
     script_path = tmp_dir / "vivy_speech.ps1"
     script_path.write_text(script, encoding="utf-8-sig")
 
-    proc = subprocess.run(
-        [
-            _powershell_exe(),
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(script_path),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                _powershell_exe(),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("PS_TIMEOUT")
 
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
 
     if proc.returncode != 0:
-        detail = stderr or stdout or f"PowerShell 退出码：{proc.returncode}"
+        detail = stderr or stdout or f"PowerShell exit code: {proc.returncode}"
         raise RuntimeError(detail)
 
     return stdout
 
 
 # =========================
-# STT (Windows system speech recognition)
+# STT (Windows voice typing handoff)
 # =========================
 
-def recognize_once(timeout_seconds: int = 8, culture: Optional[str] = None) -> str:
-    culture = (culture or _env("VIVY_STT_CULTURE", "")).strip()
-    timeout_seconds = max(3, int(timeout_seconds))
+def trigger_windows_voice_typing() -> None:
+    if os.name != "nt":
+        raise RuntimeError("Windows voice typing is only available on Windows.")
 
-    culture_ps = culture.replace("'", "''")
-    script = f"""
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Speech
+    import ctypes
 
-$culture = '{culture_ps}'
-$installed = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
-if ($null -eq $installed -or $installed.Count -eq 0) {{
-    throw 'NO_STT_ENGINE'
-}}
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+    VK_LWIN = 0x5B
+    VK_H = 0x48
 
-$chosen = $null
-if (-not [string]::IsNullOrWhiteSpace($culture)) {{
-    foreach ($r in $installed) {{
-        if ($r.Culture.Name -eq $culture -or $r.Culture.TwoLetterISOLanguageName -eq $culture) {{
-            $chosen = $r
-            break
-        }}
-    }}
-}}
-if ($null -eq $chosen) {{
-    $chosen = $installed[0]
-}}
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_uint),
+            ("time", ctypes.c_uint),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
 
-$engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine($chosen)
-$grammar = New-Object System.Speech.Recognition.DictationGrammar
-$engine.LoadGrammar($grammar)
-$engine.SetInputToDefaultAudioDevice()
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT)]
 
-$result = $engine.Recognize([TimeSpan]::FromSeconds({timeout_seconds}))
-if ($null -eq $result -or [string]::IsNullOrWhiteSpace($result.Text)) {{
-    throw 'NO_STT_TEXT'
-}}
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [
+            ("type", ctypes.c_uint),
+            ("u", _INPUTUNION),
+        ]
 
-Write-Output $result.Text
-"""
-    try:
-        text = _run_powershell(script, timeout=timeout_seconds + 8).strip()
-    except RuntimeError as e:
-        msg = str(e)
-        if "NO_STT_ENGINE" in msg:
-            raise RuntimeError("当前系统没有可用的 Windows 语音识别引擎。请先在 Windows 设置里安装语音识别/语音包。")
-        if "NO_STT_TEXT" in msg:
-            raise RuntimeError("没有识别到有效文字。请确认麦克风可用，并在点击后尽快开始说话。")
-        raise
-    if not text:
-        raise RuntimeError("没有识别到有效文字。")
-    return text
+    def _key(vk: int, keyup: bool = False) -> INPUT:
+        flags = KEYEVENTF_KEYUP if keyup else 0
+        return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0))
+
+    sequence = (
+        _key(VK_LWIN, keyup=False),
+        _key(VK_H, keyup=False),
+        _key(VK_H, keyup=True),
+        _key(VK_LWIN, keyup=True),
+    )
+    payload = (INPUT * len(sequence))(*sequence)
+    sent = user32.SendInput(len(sequence), payload, ctypes.sizeof(INPUT))
+    if sent != len(sequence):
+        raise RuntimeError("Failed to trigger Windows voice typing.")
 
 
 # =========================
@@ -131,6 +136,94 @@ Write-Output $result.Text
 # =========================
 
 _tts_lock = threading.Lock()
+_tts_state_lock = threading.Lock()
+_tts_current_token = 0
+_tts_cancel_event = threading.Event()
+_tts_active_proc = None
+_tts_active_player = None
+
+
+def set_speech_token(token: int):
+    global _tts_current_token, _tts_cancel_event
+    with _tts_state_lock:
+        _tts_current_token = int(token)
+        _tts_cancel_event = threading.Event()
+
+
+def _is_cancel_requested(token: Optional[int] = None) -> bool:
+    with _tts_state_lock:
+        if token is not None and int(token) != _tts_current_token:
+            return True
+        return _tts_cancel_event.is_set()
+
+
+def _set_active_proc(proc):
+    global _tts_active_proc
+    with _tts_state_lock:
+        _tts_active_proc = proc
+
+
+def _clear_active_proc(proc):
+    global _tts_active_proc
+    with _tts_state_lock:
+        if _tts_active_proc is proc:
+            _tts_active_proc = None
+
+
+def _set_active_player(player):
+    global _tts_active_player
+    with _tts_state_lock:
+        _tts_active_player = player
+
+
+def _clear_active_player(player):
+    global _tts_active_player
+    with _tts_state_lock:
+        if _tts_active_player is player:
+            _tts_active_player = None
+
+
+def stop_speaking():
+    global _tts_active_proc, _tts_active_player
+    with _tts_state_lock:
+        _tts_cancel_event.set()
+        proc = _tts_active_proc
+        player = _tts_active_player
+        _tts_active_proc = None
+        _tts_active_player = None
+
+    if player is not None:
+        try:
+            player.stop()
+        except Exception:
+            pass
+        try:
+            player.close()
+        except Exception:
+            pass
+
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+        if getattr(proc, "poll", lambda: None)() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    if os.name == "nt":
+        try:
+            import winsound
+
+            winsound.PlaySound(None, 0)
+        except Exception:
+            pass
 
 
 def _looks_like_wav(data: bytes) -> bool:
@@ -146,12 +239,24 @@ def _write_bytes_temp(data: bytes, suffix: str = ".wav") -> str:
     return path
 
 
-def _play_wav_file_blocking(path: str):
+def _play_wav_file_blocking(path: str, token: Optional[int] = None):
     if os.name != "nt":
-        raise RuntimeError("当前环境不是 Windows，无法直接用系统方式播放 wav。")
+        raise RuntimeError("Windows is required for WAV playback.")
     import winsound
 
-    winsound.PlaySound(path, winsound.SND_FILENAME)
+    with wave.open(path, "rb") as wav_file:
+        frames = wav_file.getnframes()
+        sample_rate = max(1, wav_file.getframerate())
+        duration = frames / float(sample_rate)
+
+    winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    deadline = time.time() + duration + 0.5
+    while time.time() < deadline:
+        if _is_cancel_requested(token):
+            winsound.PlaySound(None, 0)
+            return
+        time.sleep(0.05)
+    winsound.PlaySound(None, 0)
 
 
 def _normalize_tts_text(text: str) -> str:
@@ -159,15 +264,15 @@ def _normalize_tts_text(text: str) -> str:
     if not t:
         return t
 
-    # 统一 VIVY 的读法，避免按字母逐个读出
-    t = t.replace("VIVY", "ヴィヴィ")
-    t = t.replace("Vivy", "ヴィヴィ")
-    t = t.replace("vivy", "ヴィヴィ")
+    # 缁熶竴 VIVY 鐨勮娉曪紝閬垮厤鎸夊瓧姣嶉€愪釜璇诲嚭
+    t = t.replace("VIVY", "銉淬偅銉淬偅")
+    t = t.replace("Vivy", "銉淬偅銉淬偅")
+    t = t.replace("vivy", "銉淬偅銉淬偅")
 
     return t
 
 
-def _system_tts(text: str):
+def _system_tts(text: str, token: Optional[int] = None):
     clean_text = _normalize_tts_text(text)
     if not clean_text:
         return
@@ -191,14 +296,52 @@ if (-not [string]::IsNullOrWhiteSpace($voiceName)) {{
     try {{
         $synth.SelectVoice($voiceName)
     }} catch {{
-        # 找不到指定音色时保持默认
+        # 鎵句笉鍒版寚瀹氶煶鑹叉椂淇濇寔榛樿
     }}
 }}
 $textBytes = [System.Convert]::FromBase64String('{text_b64}')
 $text = [System.Text.Encoding]::UTF8.GetString($textBytes)
 $synth.Speak($text)
 """
-    _run_powershell(script, timeout=max(30, min(180, len(clean_text) // 2 + 10)))
+    proc = subprocess.Popen(
+        [
+            _powershell_exe(),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
+    _set_active_proc(proc)
+    try:
+        deadline = time.time() + max(30, min(180, len(clean_text) // 2 + 10))
+        while proc.poll() is None:
+            if _is_cancel_requested(token):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return
+            if time.time() > deadline:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                raise RuntimeError("System TTS playback timed out.")
+            time.sleep(0.05)
+
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0 and not _is_cancel_requested(token):
+            detail = (stderr or stdout or f"PowerShell exit code: {proc.returncode}").strip()
+            raise RuntimeError(detail)
+    finally:
+        _clear_active_proc(proc)
 
 
 def _gsv_candidate_urls() -> list[str]:
@@ -342,7 +485,7 @@ def _parse_streaming_wav_header(data: bytes):
             audio_format, channels, sample_rate = struct.unpack("<HHI", data[body_start:body_start + 8])
             bits_per_sample = struct.unpack("<H", data[body_start + 14:body_start + 16])[0]
             if audio_format != 1:
-                raise RuntimeError(f"暂只支持 PCM 流式播放，当前 audio_format={audio_format}")
+                raise RuntimeError(f"鏆傚彧鏀寔 PCM 娴佸紡鎾斁锛屽綋鍓?audio_format={audio_format}")
         elif chunk_id == b"data":
             data_offset = body_start
             break
@@ -357,9 +500,9 @@ def _parse_streaming_wav_header(data: bytes):
 class _WaveOutPlayer:
     def __init__(self, channels: int, sample_rate: int, bits_per_sample: int):
         if os.name != "nt":
-            raise RuntimeError("当前环境不是 Windows，无法使用 waveOut 流式播放。")
+            raise RuntimeError("Windows is required for waveOut streaming playback.")
         if bits_per_sample not in (8, 16):
-            raise RuntimeError(f"暂只支持 8/16 bit PCM，当前为 {bits_per_sample}")
+            raise RuntimeError(f"鏆傚彧鏀寔 8/16 bit PCM锛屽綋鍓嶄负 {bits_per_sample}")
 
         import ctypes
         from ctypes import wintypes
@@ -421,7 +564,7 @@ class _WaveOutPlayer:
             self.CALLBACK_NULL,
         )
         if res != 0:
-            raise RuntimeError(f"waveOutOpen 失败，错误码={res}")
+            raise RuntimeError(f"waveOutOpen 澶辫触锛岄敊璇爜={res}")
 
     def write(self, pcm_bytes: bytes):
         if self._closed or not pcm_bytes:
@@ -440,11 +583,11 @@ class _WaveOutPlayer:
 
         res = self._winmm.waveOutPrepareHeader(self.handle, c.byref(hdr), c.sizeof(hdr))
         if res != 0:
-            raise RuntimeError(f"waveOutPrepareHeader 失败，错误码={res}")
+            raise RuntimeError(f"waveOutPrepareHeader 澶辫触锛岄敊璇爜={res}")
         res = self._winmm.waveOutWrite(self.handle, c.byref(hdr), c.sizeof(hdr))
         if res != 0:
             self._winmm.waveOutUnprepareHeader(self.handle, c.byref(hdr), c.sizeof(hdr))
-            raise RuntimeError(f"waveOutWrite 失败，错误码={res}")
+            raise RuntimeError(f"waveOutWrite 澶辫触锛岄敊璇爜={res}")
 
         self._pending.append((buf, hdr))
         self._cleanup_done()
@@ -464,6 +607,15 @@ class _WaveOutPlayer:
             self._cleanup_done()
             time.sleep(0.01)
 
+    def stop(self):
+        if self._closed:
+            return
+        try:
+            self._winmm.waveOutReset(self.handle)
+        except Exception:
+            pass
+        self._cleanup_done()
+
     def close(self):
         if self._closed:
             return
@@ -477,7 +629,7 @@ class _WaveOutPlayer:
                 pass
 
 
-def _iter_gsv_stream_bytes(text: str) -> Iterator[bytes]:
+def _iter_gsv_stream_bytes(text: str, token: Optional[int] = None) -> Iterator[bytes]:
     clean_text = _normalize_tts_text(text)
     if not clean_text:
         return
@@ -487,6 +639,8 @@ def _iter_gsv_stream_bytes(text: str) -> Iterator[bytes]:
     errors: list[str] = []
 
     for url in _gsv_candidate_urls():
+        if _is_cancel_requested(token):
+            return
         headers = {"Accept": "*/*"}
         try:
             with requests.post(url, json=payload, headers=headers, timeout=timeout, stream=True) as resp:
@@ -501,36 +655,43 @@ def _iter_gsv_stream_bytes(text: str) -> Iterator[bytes]:
 
                 yielded = False
                 for chunk in resp.iter_content(chunk_size=4096):
+                    if _is_cancel_requested(token):
+                        return
                     if not chunk:
                         continue
                     yielded = True
                     yield chunk
                 if yielded:
                     return
-                errors.append(f"POST {url} -> 服务返回了空音频流")
+                errors.append(f"POST {url} -> empty audio stream")
         except Exception as e:
             errors.append(f"POST {url} -> {e}")
 
-    joined = "；".join(errors[-4:]) if errors else "GPT-SoVITS 请求失败"
+    joined = " ; ".join(errors[-4:]) if errors else "GPT-SoVITS request failed"
+    if _is_cancel_requested(token):
+        return
     raise RuntimeError(joined)
 
 
-def _play_gsv_streaming(text: str):
+def _play_gsv_streaming(text: str, token: Optional[int] = None):
     header_buf = bytearray()
     player = None
     try:
-        for chunk in _iter_gsv_stream_bytes(text):
+        for chunk in _iter_gsv_stream_bytes(text, token=token):
+            if _is_cancel_requested(token):
+                return
             if player is None:
                 header_buf.extend(chunk)
                 parsed = _parse_streaming_wav_header(header_buf)
                 if parsed is None:
-                    # header 还没收全，继续攒
+                    # header 杩樻病鏀跺叏锛岀户缁敀
                     if len(header_buf) > 65536:
-                        raise RuntimeError("流式音频头解析失败：收到的数据过多仍未识别 wav header。")
+                        raise RuntimeError("Streaming audio header parse failed: WAV header was not detected in time.")
                     continue
 
                 channels, sample_rate, bits_per_sample, data_offset = parsed
                 player = _WaveOutPlayer(channels, sample_rate, bits_per_sample)
+                _set_active_player(player)
                 initial_pcm = bytes(header_buf[data_offset:])
                 header_buf.clear()
                 if initial_pcm:
@@ -538,30 +699,36 @@ def _play_gsv_streaming(text: str):
             else:
                 player.write(chunk)
 
+        if _is_cancel_requested(token):
+            return
         if player is None:
-            raise RuntimeError("流式音频没有返回可播放的 WAV 头。")
+            raise RuntimeError("Streaming audio did not return a playable WAV header.")
         player.drain()
     finally:
         if player is not None:
+            _clear_active_player(player)
             player.close()
 
 
-def _request_gsv_audio(text: str) -> bytes:
+def _request_gsv_audio(text: str, token: Optional[int] = None) -> bytes:
     clean_text = _normalize_tts_text(text)
     if not clean_text:
         return b""
 
     payload = _build_gsv_payload(clean_text)
-    # 明确关闭流式，保留给非流式降级模式
-    payload["streaming_mode"] = False
+    # 鏄庣‘鍏抽棴娴佸紡锛屼繚鐣欑粰闈炴祦寮忛檷绾фā寮?    payload["streaming_mode"] = False
 
     timeout = int(_env("VIVY_GSV_TIMEOUT", "120"))
     errors: list[str] = []
 
     for url in _gsv_candidate_urls():
+        if _is_cancel_requested(token):
+            return b""
         headers = {"Accept": "*/*"}
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            if _is_cancel_requested(token):
+                return b""
             ctype = (resp.headers.get("Content-Type") or "").lower()
 
             if resp.ok and (ctype.startswith("audio/") or _looks_like_wav(resp.content)):
@@ -584,23 +751,30 @@ def _request_gsv_audio(text: str) -> bytes:
 
     if not ref_audio or not prompt_text:
         extra = (
-            "当前未设置 VIVY_GSV_REF_AUDIO 或 VIVY_GSV_PROMPT_TEXT。"
-            "很多 GPT-SoVITS /tts 接口需要这两个参数。"
+            "Current GPT-SoVITS configuration is missing VIVY_GSV_REF_AUDIO or VIVY_GSV_PROMPT_TEXT. "
+            "Many /tts endpoints require both values."
         )
     else:
-        extra = "请确认 GPT-SoVITS 服务已启动、端口正确、并且模型/参考音频已经可用。"
+        extra = (
+            "Please confirm the GPT-SoVITS service is running, the port is correct, and the model plus reference audio are available."
+        )
 
-    joined = "；".join(errors[-4:]) if errors else "GPT-SoVITS 请求失败"
-    raise RuntimeError(joined + "；" + extra)
+    joined = " ; ".join(errors[-4:]) if errors else "GPT-SoVITS request failed"
+    if _is_cancel_requested(token):
+        return b""
+    raise RuntimeError(joined + " ; " + extra)
 
 
 # =========================
 # Public TTS API
 # =========================
 
-def speak_text(text: str):
+def speak_text(text: str, token: Optional[int] = None):
     clean_text = _normalize_tts_text(text)
     if not clean_text:
+        return
+
+    if _is_cancel_requested(token):
         return
 
     mode = _env("VIVY_TTS_MODE", "gptsovits").lower()
@@ -608,43 +782,52 @@ def speak_text(text: str):
     true_stream = _env_bool("VIVY_GSV_TRUE_STREAMING", True)
 
     with _tts_lock:
+        if _is_cancel_requested(token):
+            return
         if mode == "system":
-            _system_tts(clean_text)
+            _system_tts(clean_text, token=token)
             return
 
         try:
             if true_stream:
-                _play_gsv_streaming(clean_text)
+                _play_gsv_streaming(clean_text, token=token)
                 return
 
-            audio = _request_gsv_audio(clean_text)
+            audio = _request_gsv_audio(clean_text, token=token)
             if not audio:
-                raise RuntimeError("GPT-SoVITS 没有返回音频数据。")
+                return
             wav_path = _write_bytes_temp(audio, suffix=".wav")
             try:
-                _play_wav_file_blocking(wav_path)
+                _play_wav_file_blocking(wav_path, token=token)
             finally:
                 try:
                     os.remove(wav_path)
                 except Exception:
                     pass
         except Exception:
+            if _is_cancel_requested(token):
+                return
             if fallback_system:
-                _system_tts(clean_text)
+                _system_tts(clean_text, token=token)
             else:
                 raise
 
 
-def speak_text_async(text: str):
+def speak_text_async(text: str, token: Optional[int] = None):
     clean_text = _normalize_tts_text(text)
     if not clean_text:
         return
 
     def _worker():
         try:
-            speak_text(clean_text)
+            speak_text(clean_text, token=token)
         except Exception as e:
             print(f"[VIVY TTS] {e}")
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
+
+
+
+
+

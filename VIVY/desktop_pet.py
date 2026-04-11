@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import sys
 import uuid
@@ -78,7 +78,7 @@ from PyQt6.QtWidgets import (
 from app import app as flask_app
 from db import init_db
 from creative_assist import OFFICE_CONTEXT_MAX, OFFICE_PASSAGE_MAX, load_document_text
-from speech import recognize_once, speak_text_async
+from speech import set_speech_token, speak_text_async, stop_speaking, trigger_windows_voice_typing
 
 try:
     from command_effect_stable import CommandEffect
@@ -96,7 +96,7 @@ except Exception:
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
 IMPROV_SKETCH_MESSAGE = (
-    "即兴写一个脑洞小短剧：共 3～8 行，格式为「场景一句」与「角色名：台词」交替；"
+    "即兴写一个脑洞小短剧：共 3 到 5 行，格式用“场景一句”和“角色名：台词”交替；"
     "要有一个无厘头误会，结尾用一句反转或金句收束；不要写作课讲解，不要正式标题以外的套话。"
 )
 
@@ -106,14 +106,13 @@ _FALLBACK_INSPIRATION_POOL = [
     "一封写给三天后的短信准时送达，而发件箱里并没有发送记录。",
     "雨停后，天桥上出现一串没有尽头的湿脚印，方向却是通往天空。",
 ]
-
 PROJECT_DIR = Path(__file__).resolve().parent
 USER_ID_FILE = PROJECT_DIR / ".desktop_user_id"
 GIF_PATH = PROJECT_DIR / "static" / "images" / "VIVYfirst.gif"
 PNG_FALLBACK_PATH = PROJECT_DIR / "static" / "images" / "VIVYstatr.png"
 ENV_FILE = PROJECT_DIR / ".env"
 DOMAIN_SOUND_PATH = PROJECT_DIR / "static" / "sounds" / "domain_expand.wav"
-SONG_DIR = Path(r"D:\lib\CODEGAMES\VIVY\song")
+SONG_DIR = PROJECT_DIR / "song"
 SONG_SUFFIXES = {".wav"}
 SING_TRIGGER_KEYWORDS = (
     "唱歌", "唱首歌", "唱一首", "给我唱", "你唱", "来首歌", "来一首歌",
@@ -207,9 +206,12 @@ class RequestWorker(QRunnable):
             self.signals.error.emit(str(e))
 
 
-class ChatDropFrame(QFrame):
-    """左侧对话区容器：创作形态下可拖入文档触发与菜单相同的读取流程。"""
+class RequestCancelled(RuntimeError):
+    pass
 
+
+class ChatDropFrame(QFrame):
+    """宸︿晶瀵硅瘽鍖哄鍣細鍒涗綔褰㈡€佷笅鍙嫋鍏ユ枃妗ｈЕ鍙戜笌鑿滃崟鐩稿悓鐨勮鍙栨祦绋嬨€?"""
     def __init__(self, pet: "DesktopPet"):
         super().__init__()
         self.setObjectName("vivyChatColumn")
@@ -253,7 +255,7 @@ class ChatDropFrame(QFrame):
         paths = self._local_doc_paths_from_mime(event)
         if not paths:
             if event.mimeData().hasUrls():
-                self.pet._set_status_text("仅支持拖入 .txt、.md、.docx、.pdf")
+                self.pet._set_status_text("浠呮敮鎸佹嫋鍏?.txt銆?md銆?docx銆?pdf")
             event.ignore()
             return
         event.acceptProposedAction()
@@ -261,7 +263,7 @@ class ChatDropFrame(QFrame):
 
 
 class CreativeDomainEffects(QWidget):
-    """创作领域：扩散波、光晕、粒子、几何装饰；序时与 intro_finished 信号衔接领域按钮。"""
+    """Creative domain visual effects with an intro completion signal."""
 
     intro_finished = pyqtSignal()
 
@@ -426,7 +428,7 @@ class CreativeDomainEffects(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # —— 扩散波（序贯圆环放大并淡出）——
+        # 鈥斺€?鎵╂暎娉紙搴忚疮鍦嗙幆鏀惧ぇ骞舵贰鍑猴級鈥斺€?
         if self._did_animate_intro and not self._intro_done:
             for start in self._WAVE_STARTS_MS:
                 t = self._intro_ms - start
@@ -441,7 +443,7 @@ class CreativeDomainEffects(QWidget):
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawEllipse(QRectF(cx - rr, cy - rr, 2 * rr, 2 * rr))
 
-        # —— 背景领域光晕（随 settle 扩大并定格）——
+        # 鈥斺€?鑳屾櫙棰嗗煙鍏夋檿锛堥殢 settle 鎵╁ぇ骞跺畾鏍硷級鈥斺€?
         glow_r = r_base * (0.72 + 0.62 * settle) * (1.02 + 0.04 * pulse)
         rad = QRadialGradient(cx, cy, glow_r)
         rad.setColorAt(0.0, QColor(25, 100, 190, 0))
@@ -460,7 +462,7 @@ class CreativeDomainEffects(QWidget):
         p.setBrush(QBrush(vign))
         p.drawEllipse(QRectF(cx - glow_r, cy - glow_r, glow_r * 2, glow_r * 2))
 
-        # —— 核心圈（承载 UI 的圆形边界提示）——
+        # 鈥斺€?鏍稿績鍦堬紙鎵胯浇 UI 鐨勫渾褰㈣竟鐣屾彁绀猴級鈥斺€?
         core_r = min(w, h) * 0.47
         core_pen = QPen(QColor(140, 230, 255, int(110 * o * max(0.35, settle))))
         core_pen.setWidthF(1.4)
@@ -468,7 +470,7 @@ class CreativeDomainEffects(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(QRectF(cx - core_r, cy - core_r, 2 * core_r, 2 * core_r))
 
-        # —— 装饰线：短划沿周向漂移 ——
+        # 鈥斺€?瑁呴グ绾匡細鐭垝娌垮懆鍚戞紓绉?鈥斺€?
         p.save()
         p.translate(cx, cy)
         p.rotate(self._rotation * 0.85)
@@ -485,7 +487,7 @@ class CreativeDomainEffects(QWidget):
         p.restore()
 
         if self._intro_done or not self._did_animate_intro:
-            # —— 旋转虚线环 ——
+            # 鈥斺€?鏃嬭浆铏氱嚎鐜?鈥斺€?
             p.save()
             p.translate(cx, cy)
             p.rotate(self._rotation)
@@ -501,7 +503,7 @@ class CreativeDomainEffects(QWidget):
                 p.drawEllipse(QRectF(cx - rr, cy - rr, 2 * rr, 2 * rr))
             p.restore()
 
-            # —— 六边形 ——
+            # 鈥斺€?鍏竟褰?鈥斺€?
             p.save()
             p.translate(cx, cy)
             p.rotate(-self._rotation * 0.6)
@@ -522,7 +524,7 @@ class CreativeDomainEffects(QWidget):
             p.drawPath(hex_path)
             p.restore()
 
-            # —— 放射线 ——
+            # 鈥斺€?鏀惧皠绾?鈥斺€?
             p.save()
             p.translate(cx, cy)
             p.rotate(self._rotation * 0.46)
@@ -537,7 +539,7 @@ class CreativeDomainEffects(QWidget):
                 p.drawLine(QPointF(r0 * c, r0 * s), QPointF(r1 * c, r1 * s))
             p.restore()
 
-        # —— 粒子光点 ——
+        # 鈥斺€?绮掑瓙鍏夌偣 鈥斺€?
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         for pt in self._particles:
             if not self._intro_done and self._intro_ms < pt["delay"]:
@@ -553,8 +555,7 @@ class CreativeDomainEffects(QWidget):
 
 
 class CreativeAvatarDock(QWidget):
-    """中间列：领域绘层 + 头像 + 底部领域快捷按钮。"""
-
+    """涓棿鍒楋細棰嗗煙缁樺眰 + 澶村儚 + 搴曢儴棰嗗煙蹇嵎鎸夐挳銆?"""
     def __init__(
         self,
         effects: CreativeDomainEffects,
@@ -604,8 +605,7 @@ class CreativeAvatarDock(QWidget):
 
 
 class ImmersiveWritingWindow(QWidget):
-    """仅在 VIVY 内：大屏沉浸写作，调用本机 /api/office_passage_stream，不依赖 Office 插件。"""
-
+    """浠呭湪 VIVY 鍐咃細澶у睆娌夋蹈鍐欎綔锛岃皟鐢ㄦ湰鏈?/api/office_passage_stream锛屼笉渚濊禆 Office 鎻掍欢銆?"""
     def __init__(self, pet: "DesktopPet"):
         super().__init__(None, Qt.WindowType.Window)
         self._pet = pet
@@ -613,7 +613,7 @@ class ImmersiveWritingWindow(QWidget):
         self._dirty = False
         self._suppress_dirty = False
 
-        self.setWindowTitle("VIVY 沉浸写作")
+        self.setWindowTitle("VIVY 娌夋蹈鍐欎綔")
         self.setMinimumSize(640, 420)
         self.resize(960, 680)
         self.setStyleSheet(
@@ -664,19 +664,19 @@ class ImmersiveWritingWindow(QWidget):
 
         bar1 = QHBoxLayout()
         bar1.setSpacing(6)
-        self.btn_open = mk_btn("打开", self._open_file)
+        self.btn_open = mk_btn("鎵撳紑", self._open_file)
         self._recent_menu = QMenu(self)
         self._recent_menu.aboutToShow.connect(self._fill_recent_menu)
-        self.btn_recent = QPushButton("最近")
+        self.btn_recent = QPushButton("鏈€杩?)
         self.btn_recent.setObjectName("imBarBtn")
         self.btn_recent.setMenu(self._recent_menu)
-        self.btn_new = mk_btn("新建", self._new_file)
-        self.btn_save = mk_btn("保存", self._save_file)
-        self.btn_save_as = mk_btn("另存为", self._save_as)
-        self.btn_restore_bak = mk_btn("恢复备份", self._restore_autosave)
-        self.btn_full = mk_btn("全屏", self._toggle_fullscreen)
-        self.btn_focus = mk_btn("专注", self._toggle_focus_assist)
-        self.btn_find = mk_btn("查找", self._find_in_text)
+        self.btn_new = mk_btn("鏂板缓", self._new_file)
+        self.btn_save = mk_btn("淇濆瓨", self._save_file)
+        self.btn_save_as = mk_btn("鍙﹀瓨涓?, self._save_as)
+        self.btn_restore_bak = mk_btn("鎭㈠澶囦唤", self._restore_autosave)
+        self.btn_full = mk_btn("鍏ㄥ睆", self._toggle_fullscreen)
+        self.btn_focus = mk_btn("涓撴敞", self._toggle_focus_assist)
+        self.btn_find = mk_btn("鏌ユ壘", self._find_in_text)
         for w in (
             self.btn_open,
             self.btn_recent,
@@ -696,26 +696,26 @@ class ImmersiveWritingWindow(QWidget):
         bar1.addWidget(self.lbl_autosave)
         self.spin_goal = QSpinBox()
         self.spin_goal.setRange(0, 200_000)
-        self.spin_goal.setSpecialValueText("目标字数")
+        self.spin_goal.setSpecialValueText("鐩爣瀛楁暟")
         self.spin_goal.setValue(0)
         self.spin_goal.setMaximumWidth(100)
-        self.spin_goal.setToolTip("0=不显示目标；设为字数后顶栏显示进度")
+        self.spin_goal.setToolTip("0=涓嶆樉绀虹洰鏍囷紱璁句负瀛楁暟鍚庨《鏍忔樉绀鸿繘搴?)
         self.spin_goal.valueChanged.connect(lambda _v: self._refresh_word_count())
         bar1.addWidget(self.spin_goal)
-        self.lbl_count = QLabel("0 字")
+        self.lbl_count = QLabel("0 瀛?)
         self.lbl_count.setObjectName("imBarLbl")
         bar1.addWidget(self.lbl_count)
-        self.btn_close = mk_btn("收起", self._close_safe)
+        self.btn_close = mk_btn("鏀惰捣", self._close_safe)
         bar1.addWidget(self.btn_close)
         root.addLayout(bar1)
 
         bar2 = QHBoxLayout()
         bar2.setSpacing(6)
-        self.btn_polish = mk_btn("润色", lambda: self._assist("polish"))
-        self.btn_continue = mk_btn("续写", lambda: self._assist("continue"))
-        self.btn_critique = mk_btn("点评", lambda: self._assist("critique"))
-        self.btn_improve = mk_btn("加强", lambda: self._assist("improve"))
-        self.btn_custom = mk_btn("自定义…", self._assist_custom)
+        self.btn_polish = mk_btn("娑﹁壊", lambda: self._assist("polish"))
+        self.btn_continue = mk_btn("缁啓", lambda: self._assist("continue"))
+        self.btn_critique = mk_btn("鐐硅瘎", lambda: self._assist("critique"))
+        self.btn_improve = mk_btn("鍔犲己", lambda: self._assist("improve"))
+        self.btn_custom = mk_btn("鑷畾涔夆€?, self._assist_custom)
         self._assist_buttons = [
             self.btn_polish,
             self.btn_continue,
@@ -736,31 +736,31 @@ class ImmersiveWritingWindow(QWidget):
         self.editor = QPlainTextEdit()
         self.editor.setObjectName("imWriteEditor")
         self.editor.setPlaceholderText(
-            "在此专注写作…\n"
-            "快捷键：Ctrl+S 保存，Ctrl+O 打开，Ctrl+N 新建，Ctrl+F 查找，F11 全屏，Esc 退出全屏。\n"
-            "选中一段再点「润色 / 加强」等；未选则对全文（过长会截断）。"
+            "鍦ㄦ涓撴敞鍐欎綔鈥n"
+            "蹇嵎閿細Ctrl+S 淇濆瓨锛孋trl+O 鎵撳紑锛孋trl+N 鏂板缓锛孋trl+F 鏌ユ壘锛孎11 鍏ㄥ睆锛孍sc 閫€鍑哄叏灞忋€俓n"
+            "閫変腑涓€娈靛啀鐐广€屾鼎鑹?/ 鍔犲己銆嶇瓑锛涙湭閫夊垯瀵瑰叏鏂囷紙杩囬暱浼氭埅鏂級銆?
         )
         self.editor.textChanged.connect(self._on_text_changed)
         ef = QFont(self.editor.font())
         ef.setPointSize(15)
         ef.setFamilies(
-            ["Microsoft YaHei UI", "微软雅黑", "PingFang SC", "Source Han Sans SC", "sans-serif"]
+            ["Microsoft YaHei UI", "寰蒋闆呴粦", "PingFang SC", "Source Han Sans SC", "sans-serif"]
         )
         self.editor.setFont(ef)
 
         self.assist = QTextEdit()
         self.assist.setObjectName("imWriteAssist")
         self.assist.setReadOnly(True)
-        self.assist.setPlaceholderText("VIVY 输出在此。可用下方按钮插入正文或替换选区。")
+        self.assist.setPlaceholderText("VIVY 杈撳嚭鍦ㄦ銆傚彲鐢ㄤ笅鏂规寜閽彃鍏ユ鏂囨垨鏇挎崲閫夊尯銆?)
         self.assist.setMinimumHeight(100)
         self.assist.setMaximumHeight(180)
         aw.addWidget(self.assist)
 
         assist_btns = QHBoxLayout()
         assist_btns.setSpacing(6)
-        self.btn_copy_assist = mk_btn("复制输出", self._copy_assist)
-        self.btn_insert_assist = mk_btn("插入到光标", self._insert_assist_at_cursor)
-        self.btn_replace_assist = mk_btn("替换选区", self._replace_selection_with_assist)
+        self.btn_copy_assist = mk_btn("澶嶅埗杈撳嚭", self._copy_assist)
+        self.btn_insert_assist = mk_btn("鎻掑叆鍒板厜鏍?, self._insert_assist_at_cursor)
+        self.btn_replace_assist = mk_btn("鏇挎崲閫夊尯", self._replace_selection_with_assist)
         self._assist_output_buttons = [self.btn_copy_assist, self.btn_insert_assist, self.btn_replace_assist]
         for w in self._assist_output_buttons:
             assist_btns.addWidget(w)
@@ -805,30 +805,30 @@ class ImmersiveWritingWindow(QWidget):
         n = len(t.replace("\n", "").replace("\r", ""))
         g = self.spin_goal.value()
         if g > 0:
-            self.lbl_count.setText(f"{n} / {g} 字")
+            self.lbl_count.setText(f"{n} / {g} 瀛?)
             if n >= g:
                 self.lbl_count.setStyleSheet("color: #7fe8b0; font-weight: 600;")
             else:
                 self.lbl_count.setStyleSheet("")
         else:
-            self.lbl_count.setText(f"{n} 字")
+            self.lbl_count.setText(f"{n} 瀛?)
             self.lbl_count.setStyleSheet("")
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
-            self.btn_full.setText("全屏")
+            self.btn_full.setText("鍏ㄥ睆")
         else:
             self.showFullScreen()
-            self.btn_full.setText("退出全屏")
+            self.btn_full.setText("閫€鍑哄叏灞?)
 
     def _confirm_discard(self) -> bool:
         if not self._dirty:
             return True
         r = QMessageBox.question(
             self,
-            "沉浸写作",
-            "有未保存的修改，确定收起窗口吗？",
+            "娌夋蹈鍐欎綔",
+            "鏈夋湭淇濆瓨鐨勪慨鏀癸紝纭畾鏀惰捣绐楀彛鍚楋紵",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -839,8 +839,8 @@ class ImmersiveWritingWindow(QWidget):
             return True
         r = QMessageBox.question(
             self,
-            "沉浸写作",
-            "未保存的修改将丢失，确定打开新文件吗？",
+            "娌夋蹈鍐欎綔",
+            "鏈繚瀛樼殑淇敼灏嗕涪澶憋紝纭畾鎵撳紑鏂版枃浠跺悧锛?,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -850,7 +850,7 @@ class ImmersiveWritingWindow(QWidget):
         self._recent_menu.clear()
         paths = _immersive_load_recent(14)
         if not paths:
-            a = self._recent_menu.addAction("（暂无最近文件）")
+            a = self._recent_menu.addAction("锛堟殏鏃犳渶杩戞枃浠讹級")
             a.setEnabled(False)
             return
         for p in paths:
@@ -870,14 +870,14 @@ class ImmersiveWritingWindow(QWidget):
         self._suppress_dirty = False
         self._dirty = False
         self._current_path = None
-        self.setWindowTitle("VIVY 沉浸写作")
+        self.setWindowTitle("VIVY 娌夋蹈鍐欎綔")
         self._refresh_word_count()
 
     def _load_document_from_path(self, path: str) -> None:
         try:
             text = Path(path).read_text(encoding="utf-8", errors="ignore")
         except OSError as e:
-            QMessageBox.warning(self, "沉浸写作", f"无法读取：{e}")
+            QMessageBox.warning(self, "娌夋蹈鍐欎綔", f"鏃犳硶璇诲彇锛歿e}")
             return
         self._suppress_dirty = True
         self.editor.setPlainText(text)
@@ -885,7 +885,7 @@ class ImmersiveWritingWindow(QWidget):
         self._dirty = False
         self._current_path = Path(path)
         _immersive_push_recent(path)
-        self.setWindowTitle(f"VIVY 沉浸写作 — {Path(path).name}")
+        self.setWindowTitle(f"VIVY 娌夋蹈鍐欎綔 鈥?{Path(path).name}")
         self._refresh_word_count()
 
     def _open_file(self):
@@ -893,9 +893,9 @@ class ImmersiveWritingWindow(QWidget):
             return
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "打开文本",
+            "鎵撳紑鏂囨湰",
             str(PROJECT_DIR),
-            "Markdown / 文本 (*.md *.txt);;All (*.*)",
+            "Markdown / 鏂囨湰 (*.md *.txt);;All (*.*)",
         )
         if not path:
             return
@@ -907,19 +907,19 @@ class ImmersiveWritingWindow(QWidget):
             return
         try:
             IMMERSIVE_AUTOSAVE_PATH.write_text(text, encoding="utf-8")
-            self.lbl_autosave.setText(time.strftime("%H:%M 备份"))
+            self.lbl_autosave.setText(time.strftime("%H:%M 澶囦唤"))
         except OSError:
-            self.lbl_autosave.setText("备份失败")
+            self.lbl_autosave.setText("澶囦唤澶辫触")
 
     def _restore_autosave(self) -> None:
         if not IMMERSIVE_AUTOSAVE_PATH.exists():
-            QMessageBox.information(self, "沉浸写作", "暂无自动备份（.vivy_immersive_autosave.md）。")
+            QMessageBox.information(self, "娌夋蹈鍐欎綔", "鏆傛棤鑷姩澶囦唤锛?vivy_immersive_autosave.md锛夈€?)
             return
         if self._dirty:
             r = QMessageBox.question(
                 self,
-                "沉浸写作",
-                "当前内容未保存，用备份覆盖吗？",
+                "娌夋蹈鍐欎綔",
+                "褰撳墠鍐呭鏈繚瀛橈紝鐢ㄥ浠借鐩栧悧锛?,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -928,35 +928,35 @@ class ImmersiveWritingWindow(QWidget):
         try:
             text = IMMERSIVE_AUTOSAVE_PATH.read_text(encoding="utf-8", errors="ignore")
         except OSError as e:
-            QMessageBox.warning(self, "沉浸写作", f"读取备份失败：{e}")
+            QMessageBox.warning(self, "娌夋蹈鍐欎綔", f"璇诲彇澶囦唤澶辫触锛歿e}")
             return
         self._suppress_dirty = True
         self.editor.setPlainText(text)
         self._suppress_dirty = False
         self._dirty = True
         self._current_path = None
-        self.setWindowTitle("VIVY 沉浸写作（从备份恢复）")
+        self.setWindowTitle("VIVY 娌夋蹈鍐欎綔锛堜粠澶囦唤鎭㈠锛?)
         self._refresh_word_count()
-        self._pet._set_status_text("已从自动备份恢复，建议另存为正式文件。")
+        self._pet._set_status_text("宸蹭粠鑷姩澶囦唤鎭㈠锛屽缓璁彟瀛樹负姝ｅ紡鏂囦欢銆?)
 
     def _toggle_focus_assist(self) -> None:
         self._focus_assist_hidden = not self._focus_assist_hidden
         self.assist_wrap.setVisible(not self._focus_assist_hidden)
-        self.btn_focus.setText("显示辅助区" if self._focus_assist_hidden else "专注")
+        self.btn_focus.setText("鏄剧ず杈呭姪鍖? if self._focus_assist_hidden else "涓撴敞")
 
     def _find_in_text(self) -> None:
-        needle, ok = QInputDialog.getText(self, "查找", "查找内容：")
+        needle, ok = QInputDialog.getText(self, "鏌ユ壘", "鏌ユ壘鍐呭锛?)
         if not ok or not needle:
             return
         if not self.editor.find(needle):
             self.editor.moveCursor(QTextCursor.MoveOperation.Start)
             if not self.editor.find(needle):
-                QMessageBox.information(self, "查找", "未找到匹配内容。")
+                QMessageBox.information(self, "鏌ユ壘", "鏈壘鍒板尮閰嶅唴瀹广€?)
 
     def _on_escape(self) -> None:
         if self.isFullScreen():
             self.showNormal()
-            self.btn_full.setText("全屏")
+            self.btn_full.setText("鍏ㄥ睆")
 
     def _copy_assist(self) -> None:
         t = self.assist.toPlainText().strip()
@@ -983,8 +983,8 @@ class ImmersiveWritingWindow(QWidget):
     def _assist_custom(self) -> None:
         text, ok = QInputDialog.getMultiLineText(
             self,
-            "自定义指令",
-            "希望 VIVY 对当前选区（若无选区则对全文）做什么？",
+            "鑷畾涔夋寚浠?,
+            "甯屾湜 VIVY 瀵瑰綋鍓嶉€夊尯锛堣嫢鏃犻€夊尯鍒欏鍏ㄦ枃锛夊仛浠€涔堬紵",
         )
         if ok and (text or "").strip():
             self._assist("free", goal=(text or "").strip())
@@ -1011,31 +1011,31 @@ class ImmersiveWritingWindow(QWidget):
                 self._current_path.write_text(text, encoding="utf-8")
                 self._dirty = False
                 _immersive_push_recent(str(self._current_path))
-                self._pet._set_status_text("沉浸写作已保存。")
+                self._pet._set_status_text("娌夋蹈鍐欎綔宸蹭繚瀛樸€?)
             except OSError as e:
-                QMessageBox.warning(self, "沉浸写作", f"保存失败：{e}")
+                QMessageBox.warning(self, "娌夋蹈鍐欎綔", f"淇濆瓨澶辫触锛歿e}")
             return
         self._save_as()
 
     def _save_as(self):
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "另存为",
-            str(PROJECT_DIR / "草稿.md"),
-            "Markdown (*.md);;文本 (*.txt);;All (*.*)",
+            "鍙﹀瓨涓?,
+            str(PROJECT_DIR / "鑽夌.md"),
+            "Markdown (*.md);;鏂囨湰 (*.txt);;All (*.*)",
         )
         if not path:
             return
         try:
             Path(path).write_text(self.editor.toPlainText(), encoding="utf-8")
         except OSError as e:
-            QMessageBox.warning(self, "沉浸写作", f"保存失败：{e}")
+            QMessageBox.warning(self, "娌夋蹈鍐欎綔", f"淇濆瓨澶辫触锛歿e}")
             return
         self._current_path = Path(path)
         self._dirty = False
         _immersive_push_recent(path)
-        self.setWindowTitle(f"VIVY 沉浸写作 — {Path(path).name}")
-        self._pet._set_status_text("沉浸写作已另存为。")
+        self.setWindowTitle(f"VIVY 娌夋蹈鍐欎綔 鈥?{Path(path).name}")
+        self._pet._set_status_text("娌夋蹈鍐欎綔宸插彟瀛樹负銆?)
 
     def _assist(self, action: str, goal: str | None = None):
         pet = self._pet
@@ -1043,7 +1043,7 @@ class ImmersiveWritingWindow(QWidget):
             return
         passage, context_excerpt = self._passage_and_context()
         if not passage:
-            QMessageBox.information(self, "沉浸写作", "先写一些内容，或选中一段后再请求辅助。")
+            QMessageBox.information(self, "娌夋蹈鍐欎綔", "鍏堝啓涓€浜涘唴瀹癸紝鎴栭€変腑涓€娈靛悗鍐嶈姹傝緟鍔┿€?)
             return
         if len(passage) > OFFICE_PASSAGE_MAX:
             passage = passage[:OFFICE_PASSAGE_MAX]
@@ -1086,7 +1086,7 @@ class ImmersiveWritingWindow(QWidget):
             pass
 
         def _err_stream(msg):
-            self.assist.setPlainText(f"请求失败：{msg}")
+            self.assist.setPlainText(f"璇锋眰澶辫触锛歿msg}")
 
         def _consume(progress_callback=None):
             for partial in _request_stream():
@@ -1100,7 +1100,7 @@ class ImmersiveWritingWindow(QWidget):
             _ok_stream,
             _err_stream,
             on_progress=lambda p: self.assist.setPlainText(str(p)),
-            thinking_text="VIVY 沉浸写作辅助中…",
+            thinking_text="VIVY 娌夋蹈鍐欎綔杈呭姪涓€?,
         )
 
     def _close_safe(self):
@@ -1137,6 +1137,10 @@ class DesktopPet(QWidget):
         self.auto_voice_reply = _env_bool('VIVY_AUTO_VOICE_REPLY', True)
         self.stream_tts_enabled = _env_bool('VIVY_STREAM_TTS', True)
         self._stream_tts_buffer = ''
+        self._request_serial = 0
+        self._active_chat_request_token = 0
+        self._chat_request_interruptible = False
+        self._keep_input_enabled_while_busy = False
 
         # local song player
         self._song_is_playing = False
@@ -1153,22 +1157,25 @@ class DesktopPet(QWidget):
         self._expanded_size_with_memory = QSize(784, 348)
         self._collapsed_size = QSize(292, 302)
 
-        # bubble priority: prevent system/status messages from overwriting replies
-        self._bubble_lock_until_ts = 0.0
+        # Keep the long-lived reply text separate from temporary status prompts.
+        self._bubble_main_text = "VIVY 鍚姩涓?.."
+        self._bubble_restore_timer = QTimer(self)
+        self._bubble_restore_timer.setSingleShot(True)
+        self._bubble_restore_timer.timeout.connect(self._restore_bubble_main_text)
 
         self._build_ui()
         self._init_session()
         self._start_idle_watch()
 
     def _build_ui(self):
-        self.setWindowTitle("VIVY 桌宠")
+        self.setWindowTitle("VIVY 妗屽疇")
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        # 稳定版：默认关闭按钮级透明动画，减少透明主窗上的分层更新压力。
+        # 绋冲畾鐗堬細榛樿鍏抽棴鎸夐挳绾ч€忔槑鍔ㄧ敾锛屽噺灏戦€忔槑涓荤獥涓婄殑鍒嗗眰鏇存柊鍘嬪姏銆?
         self._use_button_opacity_fx = _env_bool("VIVY_SAFE_BUTTON_FADE", False)
 
         root = QHBoxLayout(self)
@@ -1193,13 +1200,13 @@ class DesktopPet(QWidget):
         self.bubble_text.setObjectName("bubbleText")
         self.bubble_text.setMinimumHeight(56)
         self.bubble_text.setMaximumHeight(92)
-        self.bubble_text.setPlainText("VIVY 启动中…")
+        self.bubble_text.setPlainText(self._bubble_main_text)
         self.bubble_text.setAcceptDrops(False)
         bubble_layout.addWidget(self.bubble_text)
 
         bubble_action_row = QHBoxLayout()
         bubble_action_row.setSpacing(6)
-        self.btn_copy_reply = QPushButton("复制回复")
+        self.btn_copy_reply = QPushButton("澶嶅埗鍥炲")
         self.btn_copy_reply.clicked.connect(self._copy_latest_reply)
         bubble_action_row.addWidget(self.btn_copy_reply)
         bubble_action_row.addStretch(1)
@@ -1245,25 +1252,25 @@ class DesktopPet(QWidget):
         ca_row2 = QHBoxLayout()
         ca_row2.setSpacing(4)
 
-        self.btn_domain_doc = QPushButton("读文档")
+        self.btn_domain_doc = QPushButton("璇绘枃妗?)
         self.btn_domain_doc.setObjectName("vivyDomainBtn")
-        self.btn_domain_doc.setToolTip("与右键菜单相同的文档创作辅助")
+        self.btn_domain_doc.setToolTip("涓庡彸閿彍鍗曠浉鍚岀殑鏂囨。鍒涗綔杈呭姪")
         self.btn_domain_doc.clicked.connect(self._load_document_for_creative)
 
-        self.btn_domain_spark = QPushButton("创作灵感")
+        self.btn_domain_spark = QPushButton("鍒涗綔鐏垫劅")
         self.btn_domain_spark.setObjectName("vivyDomainBtn")
         self.btn_domain_spark.clicked.connect(
-            lambda: self._send_message("给我一个简短的创作灵感，带一点画面感。")
+            lambda: self._send_message("缁欐垜涓€涓畝鐭殑鍒涗綔鐏垫劅锛屽甫涓€鐐圭敾闈㈡劅銆?)
         )
 
-        self.btn_domain_clear = QPushButton("清参考")
+        self.btn_domain_clear = QPushButton("娓呭弬鑰?)
         self.btn_domain_clear.setObjectName("vivyDomainBtn")
-        self.btn_domain_clear.setToolTip("清除已读取的文档参考状态")
+        self.btn_domain_clear.setToolTip("娓呴櫎宸茶鍙栫殑鏂囨。鍙傝€冪姸鎬?)
         self.btn_domain_clear.clicked.connect(self._clear_loaded_document)
 
-        self.btn_domain_immerse = QPushButton("沉浸写作")
+        self.btn_domain_immerse = QPushButton("娌夋蹈鍐欎綔")
         self.btn_domain_immerse.setObjectName("vivyDomainBtn")
-        self.btn_domain_immerse.setToolTip("打开大屏专注写作窗口（仅 VIVY 内）")
+        self.btn_domain_immerse.setToolTip("鎵撳紑澶у睆涓撴敞鍐欎綔绐楀彛锛堜粎 VIVY 鍐咃級")
         self.btn_domain_immerse.clicked.connect(self._open_immersive_writing)
 
         self._creative_domain_buttons = [
@@ -1296,7 +1303,7 @@ class DesktopPet(QWidget):
         self.avatar_dock.setMaximumWidth(220 + 48)
         self._sync_avatar_dock_heights()
 
-        self._command_effect = CommandEffect(self, target_text="创作模式") if CommandEffect else None
+        self._command_effect = CommandEffect(self, target_text="鍒涗綔妯″紡") if CommandEffect else None
         self._command_effect_w = int(os.getenv("VIVY_COMMAND_FX_W", "220"))
         self._command_effect_h = int(os.getenv("VIVY_COMMAND_FX_H", "44"))
         self._command_effect_margin_top = int(os.getenv("VIVY_COMMAND_FX_MARGIN_TOP", "14"))
@@ -1320,21 +1327,21 @@ class DesktopPet(QWidget):
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
 
-        self.btn_inspiration = QPushButton("今日灵感")
-        self.btn_inspiration.setToolTip("获取今天的冲浪见闻 / 灵感分享")
+        self.btn_inspiration = QPushButton("浠婃棩鐏垫劅")
+        self.btn_inspiration.setToolTip("鑾峰彇浠婂ぉ鐨勫啿娴闂?/ 鐏垫劅鍒嗕韩")
         self.btn_inspiration.clicked.connect(self._on_today_inspiration)
         action_row.addWidget(self.btn_inspiration)
 
-        self.btn_improv_sketch = QPushButton("脑洞短剧")
-        self.btn_improv_sketch.setToolTip("即兴生成一段无厘头小剧场")
+        self.btn_improv_sketch = QPushButton("鑴戞礊鐭墽")
+        self.btn_improv_sketch.setToolTip("鍗冲叴鐢熸垚涓€娈垫棤鍘樺ご灏忓墽鍦?)
         self.btn_improv_sketch.clicked.connect(lambda: self._send_message(IMPROV_SKETCH_MESSAGE))
         action_row.addWidget(self.btn_improv_sketch)
 
-        self.btn_question = QPushButton("换个问题")
-        self.btn_question.clicked.connect(lambda: self._send_message("换个问题"))
+        self.btn_question = QPushButton("鎹釜闂")
+        self.btn_question.clicked.connect(lambda: self._send_message("鎹釜闂"))
         action_row.addWidget(self.btn_question)
 
-        self.btn_mode = QPushButton("形态：普通")
+        self.btn_mode = QPushButton("褰㈡€侊細鏅€?)
         self.btn_mode.clicked.connect(self._toggle_chat_mode)
         action_row.addWidget(self.btn_mode)
 
@@ -1345,7 +1352,7 @@ class DesktopPet(QWidget):
         input_row.setSpacing(6)
 
         self.input_edit = QPlainTextEdit()
-        self.input_edit.setPlaceholderText("和 VIVY 说点什么...")
+        self.input_edit.setPlaceholderText("鍜?VIVY 璇寸偣浠€涔?..")
         # typing/focus should count as interaction (prevent idle collapse while composing)
         self.input_edit.textChanged.connect(lambda: self._touch())
         self.input_edit.cursorPositionChanged.connect(lambda: self._touch())
@@ -1358,22 +1365,22 @@ class DesktopPet(QWidget):
 
         # image attach (vision)
         self._chat_image_path = None
-        self.btn_image = QPushButton("🖼")
-        self.btn_image.setToolTip("选择一张图片，让 VIVY 识别/理解（发送时将走非流式）")
+        self.btn_image = QPushButton("馃柤")
+        self.btn_image.setToolTip("閫夋嫨涓€寮犲浘鐗囷紝璁?VIVY 璇嗗埆/鐞嗚В锛堝彂閫佹椂灏嗚蛋闈炴祦寮忥級")
         self.btn_image.clicked.connect(self._pick_chat_image)
         input_row.addWidget(self.btn_image)
 
-        self.btn_image_clear = QPushButton("✖")
-        self.btn_image_clear.setToolTip("清除已选择的图片")
+        self.btn_image_clear = QPushButton("鉁?)
+        self.btn_image_clear.setToolTip("娓呴櫎宸查€夋嫨鐨勫浘鐗?)
         self.btn_image_clear.clicked.connect(self._clear_chat_image)
         self.btn_image_clear.setEnabled(False)
         input_row.addWidget(self.btn_image_clear)
 
-        self.btn_send = QPushButton("发送")
+        self.btn_send = QPushButton("鍙戦€?)
         self.btn_send.clicked.connect(self._send_from_input)
         input_row.addWidget(self.btn_send)
 
-        self.btn_voice = QPushButton("🎤语音")
+        self.btn_voice = QPushButton("馃帳璇煶")
         self.btn_voice.clicked.connect(self._start_voice_input)
         input_row.addWidget(self.btn_voice)
 
@@ -1384,18 +1391,23 @@ class DesktopPet(QWidget):
 
         interest_row = QHBoxLayout()
         interest_row.setSpacing(6)
-        self.interest_label = QLabel("兴趣：未选择")
+        self.interest_label = QLabel("鍏磋叮锛氭湭閫夋嫨")
+        self.interest_label.setStyleSheet(
+            "background: rgba(39, 160, 209, 190); "
+            "border: 1px solid rgba(121, 228, 255, 180); "
+            "border-radius: 8px; padding: 4px 8px; color: #f3fcff;"
+        )
         interest_row.addWidget(self.interest_label)
 
-        self.btn_interest_yes = QPushButton("感兴趣")
+        self.btn_interest_yes = QPushButton("鎰熷叴瓒?)
         self.btn_interest_yes.clicked.connect(lambda: self._set_interest_signal("interested"))
         interest_row.addWidget(self.btn_interest_yes)
 
-        self.btn_interest_no = QPushButton("不感兴趣")
+        self.btn_interest_no = QPushButton("涓嶆劅鍏磋叮")
         self.btn_interest_no.clicked.connect(lambda: self._set_interest_signal("not_interested"))
         interest_row.addWidget(self.btn_interest_no)
 
-        self.btn_interest_clear = QPushButton("清除")
+        self.btn_interest_clear = QPushButton("娓呴櫎")
         self.btn_interest_clear.clicked.connect(lambda: self._set_interest_signal(""))
         interest_row.addWidget(self.btn_interest_clear)
         self.controls_layout.addLayout(interest_row)
@@ -1410,50 +1422,50 @@ class DesktopPet(QWidget):
         memory_layout.setContentsMargins(8, 8, 8, 8)
         memory_layout.setSpacing(8)
 
-        self.memory_title = QLabel("记忆模块（可编辑）")
+        self.memory_title = QLabel("璁板繂妯″潡锛堝彲缂栬緫锛?)
         memory_layout.addWidget(self.memory_title)
 
         self.memory_help = QLabel(
-            "快速上手：①先刷新 ②再修改 ③最后保存"
+            "蹇€熶笂鎵嬶細鈶犲厛鍒锋柊 鈶″啀淇敼 鈶㈡渶鍚庝繚瀛?
         )
         self.memory_help.setWordWrap(True)
         self.memory_help.setObjectName("memoryHelp")
         memory_layout.addWidget(self.memory_help)
 
         guide_row = QHBoxLayout()
-        self.btn_memory_guide = QPushButton("操作指南")
+        self.btn_memory_guide = QPushButton("鎿嶄綔鎸囧崡")
         self.btn_memory_guide.clicked.connect(self._show_memory_guide)
         guide_row.addWidget(self.btn_memory_guide)
-        self.btn_memory_template = QPushButton("填入示例JSON")
+        self.btn_memory_template = QPushButton("濉叆绀轰緥JSON")
         self.btn_memory_template.clicked.connect(self._apply_memory_json_template)
         guide_row.addWidget(self.btn_memory_template)
         memory_layout.addLayout(guide_row)
 
-        self.label_summary = QLabel("短摘要 summary（1句，记录最近状态）")
+        self.label_summary = QLabel("鐭憳瑕?summary锛?鍙ワ紝璁板綍鏈€杩戠姸鎬侊級")
         memory_layout.addWidget(self.label_summary)
         self.memory_summary = QTextEdit()
-        self.memory_summary.setPlaceholderText("summary：短摘要（建议1句）")
+        self.memory_summary.setPlaceholderText("summary锛氱煭鎽樿锛堝缓璁?鍙ワ級")
         self.memory_summary.setMinimumHeight(40)
         self.memory_summary.setMaximumHeight(64)
         memory_layout.addWidget(self.memory_summary)
 
-        self.label_summary_long = QLabel("长摘要 summary_long（长期偏好/目标/边界）")
+        self.label_summary_long = QLabel("闀挎憳瑕?summary_long锛堥暱鏈熷亸濂?鐩爣/杈圭晫锛?)
         memory_layout.addWidget(self.label_summary_long)
         self.memory_summary_long = QTextEdit()
-        self.memory_summary_long.setPlaceholderText("summary_long：长摘要（长期偏好/近期目标/边界）")
+        self.memory_summary_long.setPlaceholderText("summary_long锛氶暱鎽樿锛堥暱鏈熷亸濂?杩戞湡鐩爣/杈圭晫锛?)
         self.memory_summary_long.setMinimumHeight(54)
         self.memory_summary_long.setMaximumHeight(82)
         memory_layout.addWidget(self.memory_summary_long)
 
-        self.label_prefs = QLabel("偏好 preferences JSON（必须是合法 JSON）")
+        self.label_prefs = QLabel("鍋忓ソ preferences JSON锛堝繀椤绘槸鍚堟硶 JSON锛?)
         memory_layout.addWidget(self.label_prefs)
         self.memory_prefs = QTextEdit()
-        self.memory_prefs.setPlaceholderText("preferences JSON（请保持合法JSON格式）")
+        self.memory_prefs.setPlaceholderText("preferences JSON锛堣淇濇寔鍚堟硶JSON鏍煎紡锛?)
         self.memory_prefs.setMinimumHeight(54)
         self.memory_prefs.setMaximumHeight(90)
         memory_layout.addWidget(self.memory_prefs)
 
-        self.label_turns = QLabel("最近对话回合（可按 ID 删除单条）")
+        self.label_turns = QLabel("鏈€杩戝璇濆洖鍚堬紙鍙寜 ID 鍒犻櫎鍗曟潯锛?)
         memory_layout.addWidget(self.label_turns)
         self.memory_turns = QTextEdit()
         self.memory_turns.setPlaceholderText("recent conversation turns")
@@ -1464,18 +1476,18 @@ class DesktopPet(QWidget):
 
         turn_del_row = QHBoxLayout()
         self.turn_id_input = QLineEdit()
-        self.turn_id_input.setPlaceholderText("输入回合ID删除，如 123")
+        self.turn_id_input.setPlaceholderText("杈撳叆鍥炲悎ID鍒犻櫎锛屽 123")
         turn_del_row.addWidget(self.turn_id_input)
-        self.btn_turn_delete = QPushButton("删除回合")
+        self.btn_turn_delete = QPushButton("鍒犻櫎鍥炲悎")
         self.btn_turn_delete.clicked.connect(self._delete_turn_by_id)
         turn_del_row.addWidget(self.btn_turn_delete)
         memory_layout.addLayout(turn_del_row)
 
         memory_btns = QHBoxLayout()
-        self.btn_memory_refresh = QPushButton("刷新记忆")
+        self.btn_memory_refresh = QPushButton("鍒锋柊璁板繂")
         self.btn_memory_refresh.clicked.connect(lambda: self._refresh_memory(silent=False))
         memory_btns.addWidget(self.btn_memory_refresh)
-        self.btn_memory_save = QPushButton("保存记忆")
+        self.btn_memory_save = QPushButton("淇濆瓨璁板繂")
         self.btn_memory_save.clicked.connect(self._save_memory)
         memory_btns.addWidget(self.btn_memory_save)
         memory_layout.addLayout(memory_btns)
@@ -1572,7 +1584,7 @@ class DesktopPet(QWidget):
         self._set_interest_signal("")
 
     def _target_avatar_size(self) -> QSize:
-        """根据当前头像区域，给出更稳妥的高质量缩放目标尺寸。"""
+        """鏍规嵁褰撳墠澶村儚鍖哄煙锛岀粰鍑烘洿绋冲Ε鐨勯珮璐ㄩ噺缂╂斁鐩爣灏哄銆?"""
         if getattr(self, "image_label", None) is None:
             return QSize(220, 260)
         w = max(self.image_label.minimumWidth(), self.image_label.width(), 150)
@@ -1599,8 +1611,8 @@ class DesktopPet(QWidget):
         self._set_avatar_pixmap_high_quality(pix)
 
     def _setup_avatar(self):
-        # 优先使用 GIF；不直接让 QMovie 在 QLabel 内部缩放，
-        # 而是逐帧取出后用 SmoothTransformation 缩放，画质更稳。
+        # 浼樺厛浣跨敤 GIF锛涗笉鐩存帴璁?QMovie 鍦?QLabel 鍐呴儴缂╂斁锛?
+        # 鑰屾槸閫愬抚鍙栧嚭鍚庣敤 SmoothTransformation 缂╂斁锛岀敾璐ㄦ洿绋炽€?
         self.movie = None
         self._avatar_source_size = None
 
@@ -1634,7 +1646,7 @@ class DesktopPet(QWidget):
             if getattr(self, "_command_effect", None) is not None and self.chat_mode == "creative":
                 self._play_overlay_effect(
                     self._command_effect,
-                    "创作模式",
+                    "鍒涗綔妯″紡",
                     self._command_effect_w,
                     self._command_effect_h,
                     self._command_effect_margin_top,
@@ -1660,33 +1672,73 @@ class DesktopPet(QWidget):
         USER_ID_FILE.write_text(value, encoding="utf-8")
         return value
 
-    def _set_bubble_text(self, text: str, kind: str = "reply"):
+    def _restore_bubble_main_text(self):
+        self.bubble_text.setPlainText(self._bubble_main_text)
+
+    def _set_bubble_text(self, text: str, kind: str = "reply", restore_after_ms: int = 2200):
         clean_text = (text or "").strip()
-        now = time.time()
-        if kind in ("status", "thinking"):
-            # Don't overwrite a fresh reply/stream output or other high-priority content.
-            if now < self._bubble_lock_until_ts:
-                return
+
+        if kind == "status":
             self.bubble_text.setPlainText(clean_text)
+            if self._bubble_main_text:
+                self._bubble_restore_timer.start(max(250, int(restore_after_ms)))
             return
 
-        # reply/thinking always wins
-        self.latest_reply = clean_text
+        self._bubble_restore_timer.stop()
+
+        if kind == "reply":
+            self.latest_reply = clean_text
+
+        # reply/thinking become the new main bubble content until another reply arrives.
+        self._bubble_main_text = clean_text
         self.bubble_text.setPlainText(clean_text)
-        # After a reply update, lock bubble briefly to avoid flicker/overwrites.
-        self._bubble_lock_until_ts = now + 3.0
 
     def _set_status_text(self, text: str):
         self._set_bubble_text(text, kind="status")
 
-    def _set_busy(self, busy: bool, thinking_text: str | None = "VIVY 思考中..."):
+    def _next_request_token(self) -> int:
+        self._request_serial += 1
+        return self._request_serial
+
+    def _is_chat_request_current(self, token: int) -> bool:
+        return bool(token) and self._chat_request_interruptible and token == self._active_chat_request_token
+
+    def _begin_chat_request(self) -> int:
+        token = self._next_request_token()
+        self._active_chat_request_token = token
+        self._chat_request_interruptible = True
+        self._stream_tts_buffer = ""
+        stop_speaking()
+        set_speech_token(token)
+        return token
+
+    def _finish_chat_request(self, token: int):
+        if token == self._active_chat_request_token:
+            self._chat_request_interruptible = False
+            self._keep_input_enabled_while_busy = False
+
+    def _interrupt_active_chat_request(self):
+        if not self._chat_request_interruptible:
+            return False
+        token = self._next_request_token()
+        self._active_chat_request_token = token
+        self._chat_request_interruptible = False
+        self._stream_tts_buffer = ""
+        self._keep_input_enabled_while_busy = False
+        stop_speaking()
+        set_speech_token(token)
+        self._set_busy(False)
+        return True
+
+    def _set_busy(self, busy: bool, thinking_text: str | None = "VIVY 鎬濊€冧腑..."):
         self._busy = busy
         self.btn_inspiration.setDisabled(busy)
         if hasattr(self, "btn_improv_sketch"):
             self.btn_improv_sketch.setDisabled(busy)
         self.btn_question.setDisabled(busy)
-        self.btn_send.setDisabled(busy)
-        self.input_edit.setDisabled(busy)
+        keep_input_enabled = busy and self._keep_input_enabled_while_busy
+        self.btn_send.setDisabled(busy and not keep_input_enabled)
+        self.input_edit.setDisabled(busy and not keep_input_enabled)
         if hasattr(self, "btn_voice"):
             self.btn_voice.setDisabled(busy)
         if hasattr(self, "btn_voice_toggle"):
@@ -1703,19 +1755,36 @@ class DesktopPet(QWidget):
         if busy and thinking_text:
             self._set_bubble_text(thinking_text, kind="thinking")
         if not busy:
+            self._keep_input_enabled_while_busy = False
             self._touch()
 
-    def _run_async(self, fn, on_success, on_error, on_progress=None, thinking_text: str | None = "VIVY 思考中..."):
+    def _run_async(
+        self,
+        fn,
+        on_success,
+        on_error,
+        on_progress=None,
+        thinking_text: str | None = "VIVY 鎬濊€冧腑...",
+        stale_check=None,
+        keep_input_enabled: bool = False,
+    ):
         if self._busy:
-            self._set_status_text("当前仍在处理上一请求，请稍候再试。")
+            self._set_status_text("褰撳墠浠嶅湪澶勭悊涓婁竴璇锋眰锛岃绋嶅€欏啀璇曘€?)
             return
         self._touch()
+        self._keep_input_enabled_while_busy = bool(keep_input_enabled)
         self._set_busy(True, thinking_text=thinking_text)
         worker = RequestWorker(fn)
-        worker.signals.finished.connect(lambda data: self._on_worker_success(data, on_success))
-        worker.signals.error.connect(lambda err: self._on_worker_error(err, on_error))
+        worker.signals.finished.connect(
+            lambda data: None if stale_check and stale_check() else self._on_worker_success(data, on_success)
+        )
+        worker.signals.error.connect(
+            lambda err: None if stale_check and stale_check() else self._on_worker_error(err, on_error)
+        )
         if on_progress is not None:
-            worker.signals.progress.connect(on_progress)
+            worker.signals.progress.connect(
+                lambda payload: None if stale_check and stale_check() else on_progress(payload)
+            )
         self.thread_pool.start(worker)
 
     def _run_background(self, fn, on_success=None, on_error=None, on_progress=None):
@@ -1856,7 +1925,7 @@ class DesktopPet(QWidget):
             return
         self._play_overlay_effect(
             self._command_effect,
-            "创作模式",
+            "鍒涗綔妯″紡",
             self._command_effect_w,
             self._command_effect_h,
             self._command_effect_margin_top,
@@ -1864,60 +1933,140 @@ class DesktopPet(QWidget):
 
     def _on_today_inspiration(self):
         self._touch()
-        # 统一走后端结构化灵感接口，保持“【今日冲浪见闻】发现/联想/邀请”样式。
-        self._send_message("今天有什么灵感")
+        # 缁熶竴璧板悗绔粨鏋勫寲鐏垫劅鎺ュ彛锛屼繚鎸佲€溿€愪粖鏃ュ啿娴闂汇€戝彂鐜?鑱旀兂/閭€璇封€濇牱寮忋€?
+        self._send_message("浠婂ぉ鏈変粈涔堢伒鎰?)
 
     def _copy_latest_reply(self):
         text = self.bubble_text.textCursor().selectedText().strip() or self.latest_reply
         if text:
             QApplication.clipboard().setText(text)
-            self.btn_copy_reply.setText("已复制")
-            QTimer.singleShot(800, lambda: self.btn_copy_reply.setText("复制回复"))
+            self.btn_copy_reply.setText("宸插鍒?)
+            QTimer.singleShot(800, lambda: self.btn_copy_reply.setText("澶嶅埗鍥炲"))
 
     def _update_voice_toggle_button(self):
         if hasattr(self, "btn_voice_toggle"):
-            self.btn_voice_toggle.setText(f"语音回放：{'开' if self.auto_voice_reply else '关'}")
+            self.btn_voice_toggle.setText(f"璇煶鍥炴斁锛歿'寮€' if self.auto_voice_reply else '鍏?}")
 
     def _toggle_auto_voice_reply(self):
         self._touch()
         self.auto_voice_reply = not self.auto_voice_reply
         self._update_voice_toggle_button()
-        self._set_status_text(f"语音回放已{'开启' if self.auto_voice_reply else '关闭'}。")
+        self._set_status_text(f"璇煶鍥炴斁宸瞷'寮€鍚? if self.auto_voice_reply else '鍏抽棴'}銆?)
 
     def _start_voice_input(self):
         self._touch()
 
-        def _request():
-            timeout_seconds = max(3, int(os.getenv('VIVY_STT_TIMEOUT', '8')))
-            culture = (os.getenv('VIVY_STT_CULTURE') or '').strip()
-            text = recognize_once(timeout_seconds=timeout_seconds, culture=culture or None)
-            return {'text': text}
+        dlg = QDialog(self)
+        dlg.setWindowTitle("语音输入")
+        dlg.setModal(True)
+        dlg.resize(460, 300)
+        dlg.setStyleSheet(
+            """
+            QDialog {
+                background: rgba(9, 18, 28, 238);
+                border: 1px solid rgba(121, 226, 255, 160);
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #f3fcff;
+            }
+            QTextEdit {
+                background: rgba(17, 28, 40, 230);
+                color: #f3fcff;
+                border: 1px solid rgba(93, 204, 240, 180);
+                border-radius: 10px;
+                padding: 8px;
+                selection-background-color: rgba(77, 216, 255, 120);
+            }
+            QPushButton {
+                background: #2b9ec5;
+                border: 1px solid #7be2ff;
+                border-radius: 8px;
+                color: #f3fcff;
+                padding: 6px 12px;
+                font-size: 13px;
+            }
+            QPushButton:disabled {
+                background: rgba(43, 158, 197, 120);
+                color: rgba(243, 252, 255, 150);
+            }
+            """
+        )
 
-        def _ok(data):
-            text = ((data or {}).get('text') or '').strip()
-            if not text:
-                self._set_status_text('没有识别到有效文字。')
+        layout = QVBoxLayout(dlg)
+        tip = QLabel("点击“开始听写”后直接说话。VIVY 会调用 Windows 自带语音听写；如果没有自动弹出，请手动按 Win+H。")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        edit = QTextEdit()
+        edit.setPlaceholderText("系统听写的文字会出现在这里，你也可以手动修改后再发送。")
+        layout.addWidget(edit, 1)
+
+        button_row = QHBoxLayout()
+        btn_listen = QPushButton("开始听写")
+        btn_send = QPushButton("发送")
+        btn_cancel = QPushButton("取消")
+        button_row.addWidget(btn_listen)
+        button_row.addStretch(1)
+        button_row.addWidget(btn_send)
+        button_row.addWidget(btn_cancel)
+        layout.addLayout(button_row)
+
+        def _sync_send_state():
+            btn_send.setEnabled(bool(edit.toPlainText().strip()))
+
+        def _start_dictation():
+            dlg.raise_()
+            dlg.activateWindow()
+            edit.setFocus()
+            cursor = edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            edit.setTextCursor(cursor)
+            try:
+                trigger_windows_voice_typing()
+                self._set_status_text("请直接说话，系统会把听写内容输入到窗口里。")
+            except Exception as e:
+                self._set_status_text(f"无法启动系统语音听写：{e}")
+                QMessageBox.information(
+                    dlg,
+                    "语音输入",
+                    "没有自动弹出系统语音听写。你可以手动按 Win+H 后继续说话。",
+                )
+
+        def _accept():
+            if not edit.toPlainText().strip():
+                self._set_status_text("还没有收到语音输入内容。")
                 return
-            self.input_edit.setPlainText(text)
-            self.input_edit.setFocus()
-            self._send_from_input()
+            dlg.accept()
 
-        def _err(error_msg):
-            self._set_status_text(f"语音识别失败：{error_msg}")
+        btn_listen.clicked.connect(_start_dictation)
+        btn_send.clicked.connect(_accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        edit.textChanged.connect(_sync_send_state)
+        _sync_send_state()
+        QTimer.singleShot(150, _start_dictation)
 
-        self._run_async(_request, _ok, _err, thinking_text='VIVY 正在听你说话...')
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
 
-    def _maybe_speak_reply(self, text: str):
+        text = edit.toPlainText().strip()
+        if not text:
+            return
+        self.input_edit.setPlainText(text)
+        self.input_edit.setFocus()
+        self._send_from_input()
+
+    def _maybe_speak_reply(self, text: str, token: int | None = None):
         spoken = (text or '').strip()
         if not spoken or not self.auto_voice_reply:
             return
-        speak_text_async(spoken)
+        speak_text_async(spoken, token=token)
 
     def _split_stream_tts_units(self, buffer_text: str, flush: bool = False):
         text = buffer_text or ''
         if not text:
             return [], ''
-        strong_seps = '。！？!?\n'
+        strong_seps = '銆傦紒锛??\n'
         out = []
         start = 0
         i = 0
@@ -1925,7 +2074,7 @@ class DesktopPet(QWidget):
             ch = text[i]
             if ch in strong_seps:
                 end = i + 1
-                while end < len(text) and text[end] in '”」』）】 ':
+                while end < len(text) and text[end] in '鈥濄€嶃€忥級銆?':
                     end += 1
                 unit = text[start:end].strip()
                 if unit:
@@ -1938,7 +2087,9 @@ class DesktopPet(QWidget):
             remain = ''
         return out, remain
 
-    def _on_stream_tts_progress(self, payload):
+    def _on_stream_tts_progress(self, payload, token: int | None = None):
+        if token is not None and not self._is_chat_request_current(token):
+            return
         if isinstance(payload, dict):
             partial = str(payload.get('partial') or '')
             delta = str(payload.get('delta') or '')
@@ -1953,7 +2104,7 @@ class DesktopPet(QWidget):
         units, remain = self._split_stream_tts_units(self._stream_tts_buffer, flush=False)
         self._stream_tts_buffer = remain
         for unit in units:
-            self._maybe_speak_reply(unit)
+            self._maybe_speak_reply(unit, token=token)
 
     def _spoken_text_from_messages(self, messages):
         for msg in messages or []:
@@ -1962,8 +2113,8 @@ class DesktopPet(QWidget):
                 return (msg.get('text') or '').strip()
             if mtype == 'inspiration':
                 return (
-                    f"今日冲浪见闻。发现：{msg.get('discovery', '')}。"
-                    f"联想：{msg.get('vivy_association', '')}。"
+                    f"浠婃棩鍐叉氮瑙侀椈銆傚彂鐜帮細{msg.get('discovery', '')}銆?
+                    f"鑱旀兂锛歿msg.get('vivy_association', '')}銆?
                     f"{msg.get('invitation_question', '')}"
                 ).strip()
         return ''
@@ -1983,7 +2134,7 @@ class DesktopPet(QWidget):
         # Use a custom dialog with stable readable layout.
         if options:
             dlg = QDialog(self)
-            dlg.setWindowTitle("VIVY 换个问题")
+            dlg.setWindowTitle("VIVY 鎹釜闂")
             dlg.setModal(True)
             dlg.resize(420, 260)
             dlg.setMinimumSize(380, 240)
@@ -2025,13 +2176,13 @@ class DesktopPet(QWidget):
             )
 
             layout = QVBoxLayout(dlg)
-            label = QLabel(question or "请选择一个回答：")
+            label = QLabel(question or "璇烽€夋嫨涓€涓洖绛旓細")
             label.setWordWrap(True)
             layout.addWidget(label)
 
             listw = QListWidget()
             for opt in options:
-                item = QListWidgetItem(opt.get("label", "选项"))
+                item = QListWidgetItem(opt.get("label", "閫夐」"))
                 item.setData(Qt.ItemDataRole.UserRole, opt.get("choice_id", ""))
                 listw.addItem(item)
             if listw.count() > 0:
@@ -2081,7 +2232,7 @@ class DesktopPet(QWidget):
             return
 
         for opt in options:
-            btn = QPushButton(opt.get("label", "选项"))
+            btn = QPushButton(opt.get("label", "閫夐」"))
             choice_id = opt.get("choice_id", "")
             btn.clicked.connect(lambda _, qid=question_id, cid=choice_id: self._submit_preference(qid, cid))
             self.options_layout.addWidget(btn)
@@ -2106,11 +2257,11 @@ class DesktopPet(QWidget):
         self._touch()
         self.current_interest_signal = signal or ""
         if self.current_interest_signal == "interested":
-            self.interest_label.setText("兴趣：感兴趣")
+            self.interest_label.setText("鍏磋叮锛氭劅鍏磋叮")
         elif self.current_interest_signal == "not_interested":
-            self.interest_label.setText("兴趣：不感兴趣")
+            self.interest_label.setText("鍏磋叮锛氫笉鎰熷叴瓒?)
         else:
-            self.interest_label.setText("兴趣：未选择")
+            self.interest_label.setText("鍏磋叮锛氭湭閫夋嫨")
 
     def _sync_avatar_dock_heights(self):
         extra = 58 if self.chat_mode == "creative" else 0
@@ -2186,7 +2337,7 @@ class DesktopPet(QWidget):
         self._chat_mode_for_fx = self.chat_mode
 
         if self.chat_mode == "creative":
-            self.btn_mode.setText("形态：创作")
+            self.btn_mode.setText("褰㈡€侊細鍒涗綔")
             self.controls_wrap.setStyleSheet(
                 "#vivyChatColumn { border-left: 2px solid rgba(100, 220, 255, 120); "
                 "border-radius: 10px; padding-left: 6px; background: rgba(6, 22, 36, 85); }"
@@ -2195,7 +2346,7 @@ class DesktopPet(QWidget):
             self._sync_avatar_dock_heights()
             self.domain_aura.set_creative_active(True, animate=mode_changed)
         else:
-            self.btn_mode.setText("形态：普通")
+            self.btn_mode.setText("褰㈡€侊細鏅€?)
             self.controls_wrap.setStyleSheet("")
             self._hide_creative_domain_buttons(animated=mode_changed)
             self.domain_aura.set_creative_active(False, animate=mode_changed)
@@ -2223,12 +2374,12 @@ class DesktopPet(QWidget):
             )
 
         def _ok(_data):
-            self._set_status_text("形态已切换。")
+            self._set_status_text("褰㈡€佸凡鍒囨崲銆?)
 
         def _err(error_msg):
-            self._set_status_text(f"切换形态失败：{error_msg}")
+            self._set_status_text(f"鍒囨崲褰㈡€佸け璐ワ細{error_msg}")
 
-        self._run_async(_request, _ok, _err, thinking_text="正在切换形态...")
+        self._run_async(_request, _ok, _err, thinking_text="姝ｅ湪鍒囨崲褰㈡€?..")
 
     def _toggle_chat_mode(self):
         self._touch()
@@ -2259,17 +2410,17 @@ class DesktopPet(QWidget):
             prefs = data.get("preferences") or {}
             self._set_chat_mode(prefs.get("chat_mode") or "chat", persist=False)
             if not silent:
-                self._set_status_text("记忆模块已刷新。")
+                self._set_status_text("璁板繂妯″潡宸插埛鏂般€?)
 
         def _err(error_msg):
             if not silent:
-                self._set_status_text(f"读取记忆失败：{error_msg}")
+                self._set_status_text(f"璇诲彇璁板繂澶辫触锛歿error_msg}")
 
         if silent:
             # silent refresh should never disable the UI
             self._run_background(_request, on_success=_ok, on_error=_err)
         else:
-            self._run_async(_request, _ok, _err, thinking_text="正在读取记忆...")
+            self._run_async(_request, _ok, _err, thinking_text="姝ｅ湪璇诲彇璁板繂...")
 
     def _save_memory(self):
         self._touch()
@@ -2285,31 +2436,31 @@ class DesktopPet(QWidget):
             return self._request_json("/api/memory/update", payload)
 
         def _ok(_data):
-            self._set_status_text("记忆模块已保存。")
+            self._set_status_text("璁板繂妯″潡宸蹭繚瀛樸€?)
 
         def _err(error_msg):
-            self._set_status_text(f"保存记忆失败：{error_msg}")
+            self._set_status_text(f"淇濆瓨璁板繂澶辫触锛歿error_msg}")
 
-        self._run_async(_request, _ok, _err, thinking_text="正在保存记忆...")
+        self._run_async(_request, _ok, _err, thinking_text="姝ｅ湪淇濆瓨璁板繂...")
 
     def _show_memory_guide(self):
         self._touch()
         text = (
-            "最简单的使用流程：\n\n"
-            "1) 点击“刷新记忆”\n"
-            "   先拉取数据库里的最新内容，避免覆盖旧数据。\n\n"
-            "2) 按需修改\n"
-            "   - summary：写 1 句最近状态\n"
-            "   - summary_long：写长期偏好/目标/边界\n"
-            "   - preferences JSON：必须保持合法 JSON\n\n"
-            "3) 点击“保存记忆”\n"
-            "   保存后 VIVY 后续对话会按新记忆工作。\n\n"
-            "4) 管理历史回合\n"
-            "   在“最近对话回合”里看 [ID]，输入 ID 后点“删除回合”。"
+            "鏈€绠€鍗曠殑浣跨敤娴佺▼锛歕n\n"
+            "1) 鐐瑰嚮鈥滃埛鏂拌蹇嗏€漒n"
+            "   鍏堟媺鍙栨暟鎹簱閲岀殑鏈€鏂板唴瀹癸紝閬垮厤瑕嗙洊鏃ф暟鎹€俓n\n"
+            "2) 鎸夐渶淇敼\n"
+            "   - summary锛氬啓 1 鍙ユ渶杩戠姸鎬乗n"
+            "   - summary_long锛氬啓闀挎湡鍋忓ソ/鐩爣/杈圭晫\n"
+            "   - preferences JSON锛氬繀椤讳繚鎸佸悎娉?JSON\n\n"
+            "3) 鐐瑰嚮鈥滀繚瀛樿蹇嗏€漒n"
+            "   淇濆瓨鍚?VIVY 鍚庣画瀵硅瘽浼氭寜鏂拌蹇嗗伐浣溿€俓n\n"
+            "4) 绠＄悊鍘嗗彶鍥炲悎\n"
+            "   鍦ㄢ€滄渶杩戝璇濆洖鍚堚€濋噷鐪?[ID]锛岃緭鍏?ID 鍚庣偣鈥滃垹闄ゅ洖鍚堚€濄€?
         )
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Information)
-        box.setWindowTitle("记忆模块操作指南")
+        box.setWindowTitle("璁板繂妯″潡鎿嶄綔鎸囧崡")
         box.setText(text)
         # On translucent/dark UI, the default QMessageBox theme can make text unreadable.
         box.setStyleSheet(
@@ -2340,26 +2491,26 @@ class DesktopPet(QWidget):
         self._touch()
         template = {
             "chat_mode": "chat",
-            "topic_bias": "创作",
-            "humor_level": "中",
-            "comfort_style": "陪伴",
+            "topic_bias": "鍒涗綔",
+            "humor_level": "涓?,
+            "comfort_style": "闄即",
             "last_interest_signal": "interested"
         }
         import json
 
         self.memory_prefs.setPlainText(json.dumps(template, ensure_ascii=False, indent=2))
-        self._set_status_text("已填入示例 JSON，可按需修改后保存。")
+        self._set_status_text("宸插～鍏ョず渚?JSON锛屽彲鎸夐渶淇敼鍚庝繚瀛樸€?)
 
     def _delete_turn_by_id(self):
         self._touch()
         text = (self.turn_id_input.text() or "").strip()
         if not text:
-            self._set_status_text("请输入要删除的回合ID。")
+            self._set_status_text("璇疯緭鍏ヨ鍒犻櫎鐨勫洖鍚圛D銆?)
             return
         try:
             turn_id = int(text)
         except Exception:
-            self._set_status_text("回合ID必须是数字。")
+            self._set_status_text("鍥炲悎ID蹇呴』鏄暟瀛椼€?)
             return
 
         def _request():
@@ -2370,21 +2521,21 @@ class DesktopPet(QWidget):
 
         def _ok(_data):
             self.turn_id_input.clear()
-            self._set_status_text(f"已删除回合 {turn_id}。")
+            self._set_status_text(f"宸插垹闄ゅ洖鍚?{turn_id}銆?)
             self._refresh_memory(silent=True)
 
         def _err(error_msg):
-            self._set_status_text(f"删除失败：{error_msg}")
+            self._set_status_text(f"鍒犻櫎澶辫触锛歿error_msg}")
 
-        self._run_async(_request, _ok, _err, thinking_text="正在删除回合...")
+        self._run_async(_request, _ok, _err, thinking_text="姝ｅ湪鍒犻櫎鍥炲悎...")
 
     def _set_api_key_interactive(self):
         self._touch()
         current = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
         key, ok = QInputDialog.getText(
             self,
-            "配置 DeepSeek API Key",
-            "请输入 DeepSeek API Key（会保存到 .env）：",
+            "閰嶇疆 DeepSeek API Key",
+            "璇疯緭鍏?DeepSeek API Key锛堜細淇濆瓨鍒?.env锛夛細",
             QLineEdit.EchoMode.Password,
             current,
         )
@@ -2393,11 +2544,11 @@ class DesktopPet(QWidget):
 
         new_key = (key or "").strip()
         if not new_key:
-            QMessageBox.warning(self, "提示", "API Key 不能为空。")
+            QMessageBox.warning(self, "鎻愮ず", "API Key 涓嶈兘涓虹┖銆?)
             return
 
         _save_env_value("DEEPSEEK_API_KEY", new_key)
-        self._set_status_text("API Key 已保存，后续请求将使用新配置。")
+        self._set_status_text("API Key 宸蹭繚瀛橈紝鍚庣画璇锋眰灏嗕娇鐢ㄦ柊閰嶇疆銆?)
 
     def _handle_messages(self, messages):
         if not messages:
@@ -2411,15 +2562,15 @@ class DesktopPet(QWidget):
             elif mtype == "preference_question":
                 self._show_options(
                     msg.get("question_id", ""),
-                    msg.get("question", "我想更了解你一点。"),
+                    msg.get("question", "鎴戞兂鏇翠簡瑙ｄ綘涓€鐐广€?),
                     msg.get("options", []),
                 )
             elif mtype == "inspiration":
                 self._hide_options()
                 text = (
-                    "【今日冲浪见闻】\n"
-                    f"发现：{msg.get('discovery', '')}\n"
-                    f"联想：{msg.get('vivy_association', '')}\n"
+                    "銆愪粖鏃ュ啿娴闂汇€慭n"
+                    f"鍙戠幇锛歿msg.get('discovery', '')}\n"
+                    f"鑱旀兂锛歿msg.get('vivy_association', '')}\n"
                     f"{msg.get('invitation_question', '')}"
                 )
                 self._set_bubble_text(text)
@@ -2436,9 +2587,9 @@ class DesktopPet(QWidget):
             self._refresh_memory(silent=True)
 
         def _err(error_msg):
-            self._set_status_text(f"启动失败：{error_msg}")
+            self._set_status_text(f"鍚姩澶辫触锛歿error_msg}")
 
-        self._run_async(_request, _ok, _err, thinking_text="VIVY 正在接入时间线...")
+        self._run_async(_request, _ok, _err, thinking_text="VIVY 姝ｅ湪鎺ュ叆鏃堕棿绾?..")
 
     def _submit_preference(self, question_id: str, choice_id: str):
         def _request():
@@ -2455,9 +2606,9 @@ class DesktopPet(QWidget):
             self._handle_messages(data.get("messages", []))
 
         def _err(error_msg):
-            self._set_status_text(f"记录偏好失败：{error_msg}")
+            self._set_status_text(f"璁板綍鍋忓ソ澶辫触锛歿error_msg}")
 
-        self._run_async(_request, _ok, _err, thinking_text="VIVY 正在记住你的偏好...")
+        self._run_async(_request, _ok, _err, thinking_text="VIVY 姝ｅ湪璁颁綇浣犵殑鍋忓ソ...")
 
     def _is_sing_request(self, text: str) -> bool:
         t = (text or "").strip().lower()
@@ -2493,7 +2644,7 @@ class DesktopPet(QWidget):
             pass
         self._song_is_playing = False
         try:
-            self._set_status_text("已停止唱歌。")
+            self._set_status_text("宸插仠姝㈠敱姝屻€?)
         except Exception:
             pass
 
@@ -2519,27 +2670,27 @@ class DesktopPet(QWidget):
 
             winsound.PlaySound(str(song.resolve()), winsound.SND_FILENAME | winsound.SND_ASYNC)
             self._song_is_playing = True
-            self._set_status_text(f"正在播放：{song.name}")
+            self._set_status_text(f"姝ｅ湪鎾斁锛歿song.name}")
         except Exception as e:
             self._song_is_playing = False
-            self._set_status_text(f"播放歌曲失败：{e}")
-            self._set_bubble_text("抱歉，这首歌现在没能顺利播放。请确认歌曲是 WAV 格式。")
+            self._set_status_text(f"鎾斁姝屾洸澶辫触锛歿e}")
+            self._set_bubble_text("鎶辨瓑锛岃繖棣栨瓕鐜板湪娌¤兘椤哄埄鎾斁銆傝纭姝屾洸鏄?WAV 鏍煎紡銆?)
 
 
     def _make_song_intro_text(self, request_text: str) -> str:
         t = (request_text or "").strip().lower()
-        if any(k in t for k in ("难过", "伤心", "低落", "心情不好", "安慰", "哄我")):
-            return "别急，我在。先听一首歌，好吗？"
-        if any(k in t for k in ("深夜", "晚上", "夜里", "睡不着", "失眠")):
-            return "还没睡吗。那先让我陪你听一首吧。"
-        if any(k in t for k in ("唱歌", "唱首歌", "唱一首", "给我唱", "你唱")):
-            return "我在。那就让我陪你听一首吧。"
-        return "嗯，我陪你听一首。"
+        if any(k in t for k in ("闅捐繃", "浼ゅ績", "浣庤惤", "蹇冩儏涓嶅ソ", "瀹夋叞", "鍝勬垜")):
+            return "鍒€ワ紝鎴戝湪銆傛垜缁欎綘鍞变竴棣栨瓕锛屽ソ鍚楋紵"
+        if any(k in t for k in ("娣卞", "鏅氫笂", "澶滈噷", "鐫′笉鐫€", "澶辩湢")):
+            return "杩樻病鐫″悧銆傞偅灏辫璁╂垜缁欎綘鍞变竴棣栨瓕鍚с€?
+        if any(k in t for k in ("鍞辨瓕", "鍞遍姝?, "鍞变竴棣?, "缁欐垜鍞?, "浣犲敱")):
+            return "鎴戝湪銆傞偅灏辫鎴戠粰鎮ㄥ敱涓€棣栨瓕鍚с€?
+        return "鍡紝鎴戠粰浣犲敱涓€棣栥€傛瓕"
 
 
     def _speak_then_play_song(self, song: Path, intro_text: str):
         self._set_bubble_text(intro_text)
-        self._set_status_text(f"已选中歌曲：{song.name}")
+        self._set_status_text(f"宸查€変腑姝屾洸锛歿song.name}")
 
         if self.auto_voice_reply:
             self._maybe_speak_reply(intro_text)
@@ -2554,8 +2705,8 @@ class DesktopPet(QWidget):
     def _play_random_song(self, request_text: str = "") -> bool:
         songs = self._list_song_files()
         if not songs:
-            self._set_bubble_text("我想唱给你听，但当前歌单目录里没有可播放的 WAV 歌曲文件。")
-            self._set_status_text(f"未找到 WAV 歌曲：{SONG_DIR}")
+            self._set_bubble_text("鎴戞兂鍞辩粰浣犲惉锛屼絾褰撳墠姝屽崟鐩綍閲屾病鏈夊彲鎾斁鐨?WAV 姝屾洸鏂囦欢銆?)
+            self._set_status_text(f"鏈壘鍒?WAV 姝屾洸锛歿SONG_DIR}")
             return False
 
         song = random.choice(songs)
@@ -2567,8 +2718,8 @@ class DesktopPet(QWidget):
             return True
         except Exception as e:
             self._song_is_playing = False
-            self._set_status_text(f"播放歌曲失败：{e}")
-            self._set_bubble_text("抱歉，这首歌现在没能顺利播放。请确认歌曲是 WAV 格式。")
+            self._set_status_text(f"鎾斁姝屾洸澶辫触锛歿e}")
+            self._set_bubble_text("鎶辨瓑锛岃繖棣栨瓕鐜板湪娌¤兘椤哄埄鎾斁銆傝纭姝屾洸鏄?WAV 鏍煎紡銆?)
             return False
 
 
@@ -2577,7 +2728,7 @@ class DesktopPet(QWidget):
 
         if any(k in t for k in STOP_SONG_TRIGGER_KEYWORDS):
             self._stop_song()
-            self._set_bubble_text("好，我先停下。")
+            self._set_bubble_text("濂斤紝鎴戝厛鍋滀笅銆?)
             return True
 
         if not self._is_sing_request(text):
@@ -2599,7 +2750,7 @@ class DesktopPet(QWidget):
         self._touch()
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择图片",
+            "閫夋嫨鍥剧墖",
             "",
             "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;All Files (*)",
         )
@@ -2607,7 +2758,7 @@ class DesktopPet(QWidget):
             return
         p = Path(path)
         if not p.exists() or not p.is_file():
-            self._set_status_text("选择图片失败：文件不存在。")
+            self._set_status_text("閫夋嫨鍥剧墖澶辫触锛氭枃浠朵笉瀛樺湪銆?)
             return
         max_bytes = int(os.getenv("VIVY_IMAGE_MAX_BYTES", "3000000"))
         try:
@@ -2615,22 +2766,22 @@ class DesktopPet(QWidget):
         except Exception:
             size = 0
         if size and size > max_bytes:
-            self._set_status_text(f"图片太大：{size} bytes（上限 {max_bytes}）。")
+            self._set_status_text(f"鍥剧墖澶ぇ锛歿size} bytes锛堜笂闄?{max_bytes}锛夈€?)
             return
 
         self._chat_image_path = str(p)
-        self.btn_image.setText("🖼✓")
+        self.btn_image.setText("馃柤鉁?)
         self.btn_image_clear.setEnabled(True)
-        self._set_status_text(f"已选择图片：{p.name}")
+        self._set_status_text(f"宸查€夋嫨鍥剧墖锛歿p.name}")
 
     def _clear_chat_image(self, silent: bool = False):
         self._chat_image_path = None
         if hasattr(self, "btn_image"):
-            self.btn_image.setText("🖼")
+            self.btn_image.setText("馃柤")
         if hasattr(self, "btn_image_clear"):
             self.btn_image_clear.setEnabled(False)
         if not silent:
-            self._set_status_text("已清除图片。")
+            self._set_status_text("宸叉竻闄ゅ浘鐗囥€?)
 
     def _build_chat_image_payload(self) -> dict | None:
         path = getattr(self, "_chat_image_path", None)
@@ -2661,13 +2812,25 @@ class DesktopPet(QWidget):
         if self._try_handle_local_song_request(text):
             return
 
+        if self._busy:
+            if self._chat_request_interruptible:
+                self._interrupt_active_chat_request()
+            else:
+                self._set_status_text("褰撳墠浠嶅湪澶勭悊涓婁竴璇锋眰锛岃绋嶅€欏啀璇曘€?)
+                return
+
+        request_token = self._begin_chat_request()
+        is_stale = lambda: not self._is_chat_request_current(request_token)
+
         # Commands that require structured messages should use non-stream endpoint.
         lower = (text or "").lower()
         has_image = bool(getattr(self, "_chat_image_path", None))
-        is_structured = has_image or ("换个问题" in text) or ("了解我" in text) or ("灵感" in text) or ("冲浪" in lower)
+        is_structured = has_image or ("鎹釜闂" in text) or ("浜嗚В鎴? in text) or ("鐏垫劅" in text) or ("鍐叉氮" in lower)
 
         if is_structured:
             def _request():
+                if is_stale():
+                    raise RequestCancelled("cancelled")
                 payload = {
                     "user_id": self.user_id,
                     "message": text,
@@ -2685,22 +2848,33 @@ class DesktopPet(QWidget):
                 )
 
             def _ok(data):
+                self._finish_chat_request(request_token)
                 messages = data.get("messages", [])
                 self._handle_messages(messages)
                 spoken = self._spoken_text_from_messages(messages)
                 if spoken:
-                    self._maybe_speak_reply(spoken)
+                    self._maybe_speak_reply(spoken, token=request_token)
                 self._refresh_memory(silent=True)
                 if has_image:
                     self._clear_chat_image(silent=True)
 
             def _err(error_msg):
-                self._set_status_text(f"请求失败：{error_msg}")
+                self._finish_chat_request(request_token)
+                self._set_status_text(f"璇锋眰澶辫触锛歿error_msg}")
 
-            self._run_async(_request, _ok, _err, thinking_text="VIVY 思考中...")
+            self._run_async(
+                _request,
+                _ok,
+                _err,
+                thinking_text="VIVY 鎬濊€冧腑...",
+                stale_check=is_stale,
+                keep_input_enabled=True,
+            )
             return
 
         def _request_stream():
+            if is_stale():
+                raise RequestCancelled("cancelled")
             url = f"{self.api_base}/api/message_stream"
             payload = {
                 "user_id": self.user_id,
@@ -2708,56 +2882,61 @@ class DesktopPet(QWidget):
                 "interest_signal": self.current_interest_signal or None,
                 "chat_mode": self.chat_mode,
             }
-            resp = requests.post(url, json=payload, timeout=30, stream=True)
-            resp.raise_for_status()
+            with requests.post(url, json=payload, timeout=30, stream=True) as resp:
+                resp.raise_for_status()
 
-            import json
+                import json
 
-            assembled = ""
-            self._stream_tts_buffer = ""
-            for raw in resp.iter_lines(decode_unicode=True):
-                if not raw:
-                    continue
-                line = raw.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:") :].strip()
-                try:
-                    obj = json.loads(data)
-                except Exception:
-                    continue
+                assembled = ""
+                self._stream_tts_buffer = ""
+                for raw in resp.iter_lines(decode_unicode=True):
+                    if is_stale():
+                        raise RequestCancelled("cancelled")
+                    if not raw:
+                        continue
+                    line = raw.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:") :].strip()
+                    try:
+                        obj = json.loads(data)
+                    except Exception:
+                        continue
 
-                if obj.get("error"):
-                    raise RuntimeError(obj["error"])
-                if obj.get("done"):
-                    break
-                delta = obj.get("delta") or ""
-                if delta:
-                    assembled += delta
-                    # 返回“当前累计文本”和“本次增量”，用于 UI 实时刷新和流式播报
-                    yield {"partial": assembled, "delta": delta}
+                    if obj.get("error"):
+                        raise RuntimeError(obj["error"])
+                    if obj.get("done"):
+                        break
+                    delta = obj.get("delta") or ""
+                    if delta:
+                        assembled += delta
+                        # 杩斿洖鈥滃綋鍓嶇疮璁℃枃鏈€濆拰鈥滄湰娆″閲忊€濓紝鐢ㄤ簬 UI 瀹炴椂鍒锋柊鍜屾祦寮忔挱鎶?                        yield {"partial": assembled, "delta": delta}
 
             return assembled
 
         def _ok_stream(data):
+            self._finish_chat_request(request_token)
             reply_text = ((data or {}).get("text") or "").strip()
             if self.auto_voice_reply:
                 if self.stream_tts_enabled:
                     units, _remain = self._split_stream_tts_units(self._stream_tts_buffer, flush=True)
                     self._stream_tts_buffer = ""
                     for unit in units:
-                        self._maybe_speak_reply(unit)
+                        self._maybe_speak_reply(unit, token=request_token)
                 elif reply_text:
-                    self._maybe_speak_reply(reply_text)
+                    self._maybe_speak_reply(reply_text, token=request_token)
             self._refresh_memory(silent=True)
 
         def _err_stream(error_msg):
+            self._finish_chat_request(request_token)
             self._stream_tts_buffer = ""
-            self._set_status_text(f"请求失败：{error_msg}")
+            self._set_status_text(f"璇锋眰澶辫触锛歿error_msg}")
 
         def _consume(progress_callback=None):
             final_text = ""
             for payload in _request_stream():
+                if is_stale():
+                    raise RequestCancelled("cancelled")
                 if isinstance(payload, dict):
                     final_text = str(payload.get("partial") or final_text)
                 else:
@@ -2770,15 +2949,17 @@ class DesktopPet(QWidget):
             _consume,
             _ok_stream,
             _err_stream,
-            on_progress=self._on_stream_tts_progress,
-            thinking_text="VIVY 思考中（流式输出）...",
+            on_progress=lambda payload: self._on_stream_tts_progress(payload, token=request_token),
+            thinking_text="VIVY 鎬濊€冧腑锛堟祦寮忚緭鍑猴級...",
+            stale_check=is_stale,
+            keep_input_enabled=True,
         )
 
     def _touch(self):
         self._last_interaction_ts = time.time()
 
     def _avatar_anchor_global(self) -> QPoint:
-        """取人物图片底部中点作为屏幕锚点。"""
+        """鍙栦汉鐗╁浘鐗囧簳閮ㄤ腑鐐逛綔涓哄睆骞曢敋鐐广€?"""
         if getattr(self, "image_label", None) is None:
             return self.mapToGlobal(self.rect().center())
 
@@ -2786,7 +2967,7 @@ class DesktopPet(QWidget):
         return self.image_label.mapToGlobal(local_pt)
 
     def _move_window_to_keep_anchor(self, old_anchor: QPoint):
-        """窗口尺寸/布局变化后，校正位置，保持人物锚点不漂移。"""
+        """绐楀彛灏哄/甯冨眬鍙樺寲鍚庯紝鏍℃浣嶇疆锛屼繚鎸佷汉鐗╅敋鐐逛笉婕傜Щ銆?"""
         new_anchor = self._avatar_anchor_global()
         dx = old_anchor.x() - new_anchor.x()
         dy = old_anchor.y() - new_anchor.y()
@@ -2802,8 +2983,8 @@ class DesktopPet(QWidget):
         self._idle_collapsed = collapsed
         self.controls_wrap.setVisible(not collapsed)
 
-        # 底部创作领域按钮挂在 avatar_dock 下，不属于 controls_wrap；
-        # 收起时必须额外隐藏，否则会残留在人物外侧。
+        # 搴曢儴鍒涗綔棰嗗煙鎸夐挳鎸傚湪 avatar_dock 涓嬶紝涓嶅睘浜?controls_wrap锛?
+        # 鏀惰捣鏃跺繀椤婚澶栭殣钘忥紝鍚﹀垯浼氭畫鐣欏湪浜虹墿澶栦晶銆?
         if hasattr(self, "creative_actions"):
             if collapsed:
                 self.creative_actions.hide()
@@ -2909,16 +3090,16 @@ class DesktopPet(QWidget):
             }
             """
         )
-        act_reset = QAction("重置本机用户ID", self)
-        act_set_api_key = QAction("设置 API Key", self)
-        act_toggle_memory = QAction("显示/隐藏记忆模块", self)
-        act_toggle_idle = QAction("切换待机收起", self)
-        act_set_idle_timeout = QAction("设置待机时长", self)
-        act_load_doc = QAction("读取文档（创作辅助）", self)
-        act_clear_doc = QAction("清除已读取文档", self)
-        act_immersive = QAction("沉浸写作窗口…", self)
-        act_stop_song = QAction("停止唱歌", self)
-        act_quit = QAction("退出 VIVY", self)
+        act_reset = QAction("閲嶇疆鏈満鐢ㄦ埛ID", self)
+        act_set_api_key = QAction("璁剧疆 API Key", self)
+        act_toggle_memory = QAction("鏄剧ず/闅愯棌璁板繂妯″潡", self)
+        act_toggle_idle = QAction("鍒囨崲寰呮満鏀惰捣", self)
+        act_set_idle_timeout = QAction("璁剧疆寰呮満鏃堕暱", self)
+        act_load_doc = QAction("璇诲彇鏂囨。锛堝垱浣滆緟鍔╋級", self)
+        act_clear_doc = QAction("娓呴櫎宸茶鍙栨枃妗?, self)
+        act_immersive = QAction("娌夋蹈鍐欎綔绐楀彛鈥?, self)
+        act_stop_song = QAction("鍋滄鍞辨瓕", self)
+        act_quit = QAction("閫€鍑?VIVY", self)
 
         act_reset.triggered.connect(self._reset_user)
         act_set_api_key.triggered.connect(self._set_api_key_interactive)
@@ -2928,7 +3109,7 @@ class DesktopPet(QWidget):
         act_load_doc.triggered.connect(self._load_document_for_creative)
         act_clear_doc.triggered.connect(self._clear_loaded_document)
         act_immersive.triggered.connect(self._open_immersive_writing)
-        act_stop_song.triggered.connect(lambda: (self._stop_song(), self._set_bubble_text("好，我先停下。")))
+        act_stop_song.triggered.connect(lambda: (self._stop_song(), self._set_bubble_text("濂斤紝鎴戝厛鍋滀笅銆?)))
         act_quit.triggered.connect(QApplication.instance().quit)
 
         menu.addAction(act_reset)
@@ -2951,12 +3132,80 @@ class DesktopPet(QWidget):
         self._apply_window_size()
 
 
+    def _get_themed_int(self, title: str, label: str, value: int, minimum: int, maximum: int, step: int = 1):
+        dlg = QInputDialog(self)
+        dlg.setInputMode(QInputDialog.InputMode.IntInput)
+        dlg.setWindowTitle(title)
+        dlg.setLabelText(label)
+        dlg.setIntRange(int(minimum), int(maximum))
+        dlg.setIntStep(int(step))
+        dlg.setIntValue(int(value))
+        dlg.setOkButtonText("\u786e\u5b9a")
+        dlg.setCancelButtonText("\u53d6\u6d88")
+        dlg.setStyleSheet(
+            """
+            QInputDialog, QInputDialog QWidget {
+                background: rgba(10, 18, 26, 245);
+                color: #eaf8ff;
+                font-size: 12px;
+            }
+            QInputDialog QLabel {
+                color: #dff6ff;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QInputDialog QSpinBox {
+                background: rgba(10, 18, 26, 220);
+                border: 1px solid rgba(78, 208, 255, 180);
+                border-radius: 8px;
+                padding: 4px 8px;
+                color: #f2fbff;
+                selection-background-color: rgba(55, 214, 255, 160);
+            }
+            QInputDialog QSpinBox::up-button,
+            QInputDialog QSpinBox::down-button {
+                width: 18px;
+                border: 0;
+                background: rgba(39, 160, 209, 190);
+                border-radius: 6px;
+                margin: 2px;
+            }
+            QInputDialog QSpinBox::up-button:hover,
+            QInputDialog QSpinBox::down-button:hover {
+                background: rgba(57, 186, 241, 210);
+            }
+            QInputDialog QPushButton {
+                background: rgba(39, 160, 209, 190);
+                border: 1px solid rgba(121, 228, 255, 180);
+                border-radius: 8px;
+                padding: 5px 10px;
+                color: #f3fcff;
+                min-width: 72px;
+            }
+            QInputDialog QPushButton:hover {
+                background: rgba(57, 186, 241, 210);
+            }
+            """
+        )
+
+        spin = dlg.findChild(QSpinBox)
+        if spin is not None:
+            line_edit = spin.lineEdit()
+            if line_edit is not None:
+                line_edit.setStyleSheet(
+                    "background: transparent; border: 0; color: #f2fbff; selection-background-color: rgba(55, 214, 255, 160);"
+                )
+                line_edit.selectAll()
+
+        ok = dlg.exec() == QDialog.DialogCode.Accepted
+        return dlg.intValue(), ok
+
+
     def _set_idle_timeout_interactive(self):
         self._touch()
-        value, ok = QInputDialog.getInt(
-            self,
-            "设置待机时长",
-            "多少秒不操作后进入待机：",
+        value, ok = self._get_themed_int(
+            "\u8bbe\u7f6e\u5f85\u673a\u65f6\u957f",
+            "\u591a\u5c11\u79d2\u4e0d\u64cd\u4f5c\u540e\u8fdb\u5165\u5f85\u673a\uff1a",
             int(self._idle_timeout_s),
             5,
             3600,
@@ -2967,14 +3216,14 @@ class DesktopPet(QWidget):
 
         self._idle_timeout_s = int(value)
         _save_env_value("VIVY_IDLE_TIMEOUT", str(self._idle_timeout_s))
-        self._set_status_text(f"待机时长已设置为 {self._idle_timeout_s} 秒。")
+        self._set_status_text(f"\u5f85\u673a\u65f6\u957f\u5df2\u8bbe\u7f6e\u4e3a {self._idle_timeout_s} \u79d2\u3002")
 
 
     def _load_document_for_creative(self):
         self._touch()
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择要读取的文档",
+            "閫夋嫨瑕佽鍙栫殑鏂囨。",
             str(PROJECT_DIR),
             "Documents (*.txt *.md *.docx *.pdf);;All Files (*.*)",
         )
@@ -2983,8 +3232,8 @@ class DesktopPet(QWidget):
 
         goal, ok = QInputDialog.getText(
             self,
-            "创作目标（可选）",
-            "你希望 VIVY 从这个文档里帮你做什么？（可留空）",
+            "鍒涗綔鐩爣锛堝彲閫夛級",
+            "浣犲笇鏈?VIVY 浠庤繖涓枃妗ｉ噷甯綘鍋氫粈涔堬紵锛堝彲鐣欑┖锛?,
             QLineEdit.EchoMode.Normal,
             "",
         )
@@ -2994,7 +3243,7 @@ class DesktopPet(QWidget):
         self._start_creative_doc_stream(path, (goal or "").strip())
 
     def _start_creative_doc_stream(self, path: str, goal: str = ""):
-        """菜单「读取文档」与创作形态下拖放共用：流式调用 creative_doc_stream。"""
+        """鑿滃崟銆岃鍙栨枃妗ｃ€嶄笌鍒涗綔褰㈡€佷笅鎷栨斁鍏辩敤锛氭祦寮忚皟鐢?creative_doc_stream銆?"""
         self._touch()
         goal = (goal or "").strip()
 
@@ -3038,7 +3287,7 @@ class DesktopPet(QWidget):
             self._refresh_memory(silent=True)
 
         def _err_stream(error_msg):
-            self._set_status_text(f"文档创作辅助失败：{error_msg}")
+            self._set_status_text(f"鏂囨。鍒涗綔杈呭姪澶辫触锛歿error_msg}")
 
         def _consume(progress_callback=None):
             for partial in _request_stream():
@@ -3051,13 +3300,13 @@ class DesktopPet(QWidget):
             _ok_stream,
             _err_stream,
             on_progress=lambda partial: self._set_bubble_text(str(partial)),
-            thinking_text="VIVY 正在阅读文档并给创作建议（流式）...",
+            thinking_text="VIVY 姝ｅ湪闃呰鏂囨。骞剁粰鍒涗綔寤鸿锛堟祦寮忥級...",
         )
 
     def _clear_loaded_document(self):
         self._touch()
         self._loaded_doc_path = None
-        self._set_status_text("已清除已读取文档。")
+        self._set_status_text("宸叉竻闄ゅ凡璇诲彇鏂囨。銆?)
 
     def _open_immersive_writing(self):
         self._touch()
@@ -3071,7 +3320,7 @@ class DesktopPet(QWidget):
         self._touch()
         self.user_id = str(uuid.uuid4())
         USER_ID_FILE.write_text(self.user_id, encoding="utf-8")
-        self._set_status_text("已重置本机 user_id。重新初始化中…")
+        self._set_status_text("宸查噸缃湰鏈?user_id銆傞噸鏂板垵濮嬪寲涓€?)
         QTimer.singleShot(300, self._init_session)
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -3099,7 +3348,7 @@ class DesktopPet(QWidget):
             if getattr(self, "_command_effect", None) is not None and self.chat_mode == "creative":
                 self._play_overlay_effect(
                     self._command_effect,
-                    "创作模式",
+                    "鍒涗綔妯″紡",
                     self._command_effect_w,
                     self._command_effect_h,
                     self._command_effect_margin_top,
@@ -3186,8 +3435,8 @@ def _ensure_api_key(parent=None) -> bool:
 
     key, ok = QInputDialog.getText(
         parent,
-        "首次配置 API Key",
-        "检测到未配置 DeepSeek API Key，请输入（会保存到 .env）：",
+        "棣栨閰嶇疆 API Key",
+        "妫€娴嬪埌鏈厤缃?DeepSeek API Key锛岃杈撳叆锛堜細淇濆瓨鍒?.env锛夛細",
         QLineEdit.EchoMode.Password,
     )
     if not ok:
@@ -3208,13 +3457,13 @@ def main():
 
     qt_app = QApplication(sys.argv)
     if not _ensure_api_key():
-        QMessageBox.information(None, "提示", "未配置 API Key，本次将以离线兜底模式运行。可右键桌宠 -> 设置 API Key。")
+        QMessageBox.information(None, "鎻愮ず", "鏈厤缃?API Key锛屾湰娆″皢浠ョ绾垮厹搴曟ā寮忚繍琛屻€傚彲鍙抽敭妗屽疇 -> 璁剧疆 API Key銆?)
 
     # Start embedded Flask backend
     run_flask_background(port)
 
     if not wait_server_ready(base_url, timeout=12):
-        print("Flask 后端启动超时，请检查端口占用或配置")
+        print("Flask 鍚庣鍚姩瓒呮椂锛岃妫€鏌ョ鍙ｅ崰鐢ㄦ垨閰嶇疆")
 
     pet = DesktopPet(api_base=base_url)
     pet.show()
@@ -3223,3 +3472,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
