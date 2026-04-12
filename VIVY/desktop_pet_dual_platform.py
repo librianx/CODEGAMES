@@ -1162,7 +1162,7 @@ class DesktopPet(QWidget):
         self._collapsed_size = QSize(292, 302)
 
         # Keep the long-lived reply text separate from temporary status prompts.
-        self._bubble_main_text = "VIVY ????"
+        self._bubble_main_text = "VIVY 在这里。"
         self._bubble_restore_timer = QTimer(self)
         self._bubble_restore_timer.setSingleShot(True)
         self._bubble_restore_timer.timeout.connect(self._restore_bubble_main_text)
@@ -1728,7 +1728,7 @@ class DesktopPet(QWidget):
         self._set_busy(False)
         return True
 
-    def _set_busy(self, busy: bool, thinking_text: str | None = "VIVY ???..."):
+    def _set_busy(self, busy: bool, thinking_text: str | None = "VIVY 思考中..."):
         self._busy = busy
         self.btn_inspiration.setDisabled(busy)
         if hasattr(self, "btn_improv_sketch"):
@@ -1761,12 +1761,12 @@ class DesktopPet(QWidget):
         on_success,
         on_error,
         on_progress=None,
-        thinking_text: str | None = "VIVY ???...",
+        thinking_text: str | None = "VIVY 思考中...",
         stale_check=None,
         keep_input_enabled: bool = False,
     ):
         if self._busy:
-            self._set_status_text("?????????????????")
+            self._set_status_text("当前还有回复在处理，请稍等一下。")
             return
         self._touch()
         self._keep_input_enabled_while_busy = bool(keep_input_enabled)
@@ -1954,7 +1954,7 @@ class DesktopPet(QWidget):
         self._touch()
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("????")
+        dlg.setWindowTitle("语音输入")
         dlg.setModal(True)
         dlg.resize(460, 300)
         dlg.setStyleSheet(
@@ -1991,21 +1991,21 @@ class DesktopPet(QWidget):
         )
 
         layout = QVBoxLayout(dlg)
-        dictation_hint = "??????????????VIVY ??????????????????????????????"
+        dictation_hint = "点“开始听写”后，直接把系统听写结果说出来；文字会先落在这里，再由你确认发送给 VIVY。"
         if sys.platform == "darwin":
-            dictation_hint = "?????????????? Fn ?????? macOS ?????????????????"
+            dictation_hint = "点“开始听写”后，请在文本框聚焦状态下按 Fn 连按两次，启动 macOS 系统听写。"
         tip = QLabel(dictation_hint)
         tip.setWordWrap(True)
         layout.addWidget(tip)
 
         edit = QTextEdit()
-        edit.setPlaceholderText("???????????????????????????")
+        edit.setPlaceholderText("听写文字会出现在这里，你也可以先手动修改，再发送。")
         layout.addWidget(edit, 1)
 
         button_row = QHBoxLayout()
-        btn_listen = QPushButton("????")
-        btn_send = QPushButton("??")
-        btn_cancel = QPushButton("??")
+        btn_listen = QPushButton("开始听写")
+        btn_send = QPushButton("发送")
+        btn_cancel = QPushButton("取消")
         button_row.addWidget(btn_listen)
         button_row.addStretch(1)
         button_row.addWidget(btn_send)
@@ -2025,20 +2025,20 @@ class DesktopPet(QWidget):
             try:
                 started = trigger_system_voice_dictation()
                 if started:
-                    self._set_status_text("?????????????????????")
+                    self._set_status_text("系统听写已打开，请直接说话。")
                 else:
-                    self._set_status_text("?????????????????")
+                    self._set_status_text("未能自动打开系统听写，请手动使用系统快捷键。")
             except Exception as e:
-                self._set_status_text(f"???????????{e}")
+                self._set_status_text(f"启动听写失败：{e}")
                 QMessageBox.information(
                     dlg,
-                    "????",
-                    "?????????????????????????????????",
+                    "提示",
+                    "系统没有自动打开听写，请手动使用系统听写快捷键后再试。",
                 )
 
         def _accept():
             if not edit.toPlainText().strip():
-                self._set_status_text("????????????")
+                self._set_status_text("请先说点内容，或输入一点文字。")
                 return
             dlg.accept()
 
@@ -2683,12 +2683,12 @@ class DesktopPet(QWidget):
     def _make_song_intro_text(self, request_text: str) -> str:
         t = (request_text or "").strip().lower()
         if any(k in t for k in ("难过", "伤心", "低落", "心情不好", "安慰", "哄我")):
-            return "别急，我在。先听一首歌，好吗？"
+            return "别急，我在。我给你唱一首歌，好吗？"
         if any(k in t for k in ("深夜", "晚上", "夜里", "睡不着", "失眠")):
-            return "还没睡吗。那先让我陪你听一首吧。"
+            return "还没睡吗。那就请让我给你唱一首歌吧。"
         if any(k in t for k in ("唱歌", "唱首歌", "唱一首", "给我唱", "你唱")):
-            return "我在。那就让我陪你听一首吧。"
-        return "嗯，我陪你听一首。"
+            return "我在。那就让我给您唱一首歌吧。"
+        return "嗯，我给你唱一首。歌"
 
 
     def _speak_then_play_song(self, song: Path, intro_text: str):
@@ -2819,7 +2819,7 @@ class DesktopPet(QWidget):
             if self._chat_request_interruptible:
                 self._interrupt_active_chat_request()
             else:
-                self._set_status_text("?????????????????")
+                self._set_status_text("当前还有回复在处理，请稍等一下。")
                 return
 
         request_token = self._begin_chat_request()
@@ -2827,7 +2827,14 @@ class DesktopPet(QWidget):
 
         lower = (text or "").lower()
         has_image = bool(getattr(self, "_chat_image_path", None))
-        is_structured = has_image or ("????" in text) or ("???" in text) or ("??" in text) or ("??" in lower)
+        is_structured = (
+            has_image
+            or ("换个问题" in text)
+            or ("了解我" in text)
+            or ("今天有什么灵感" in text)
+            or ("今天有灵感" in text)
+            or ("灵感" in text)
+        )
 
         if is_structured:
             def _request():
@@ -2858,13 +2865,13 @@ class DesktopPet(QWidget):
 
             def _err(error_msg):
                 self._finish_chat_request(request_token)
-                self._set_status_text(f"?????{error_msg}")
+                self._set_status_text(f"请求失败：{error_msg}")
 
             self._run_async(
                 _request,
                 _ok,
                 _err,
-                thinking_text="VIVY ???...",
+                thinking_text="VIVY 思考中...",
                 stale_check=is_stale,
                 keep_input_enabled=True,
             )
@@ -2927,7 +2934,7 @@ class DesktopPet(QWidget):
         def _err_stream(error_msg):
             self._finish_chat_request(request_token)
             self._stream_tts_buffer = ""
-            self._set_status_text(f"?????{error_msg}")
+            self._set_status_text(f"请求失败：{error_msg}")
 
         def _consume(progress_callback=None):
             final_text = ""
@@ -2947,7 +2954,7 @@ class DesktopPet(QWidget):
             _ok_stream,
             _err_stream,
             on_progress=lambda payload: self._on_stream_tts_progress(payload, token=request_token),
-            thinking_text="VIVY ?????????...",
+            thinking_text="VIVY 正在组织回答...",
             stale_check=is_stale,
             keep_input_enabled=True,
         )
@@ -3135,8 +3142,8 @@ class DesktopPet(QWidget):
         dlg.setIntRange(int(minimum), int(maximum))
         dlg.setIntStep(int(step))
         dlg.setIntValue(int(value))
-        dlg.setOkButtonText("??")
-        dlg.setCancelButtonText("??")
+        dlg.setOkButtonText("确定")
+        dlg.setCancelButtonText("取消")
         dlg.setStyleSheet(
             """
             QInputDialog, QInputDialog QWidget {
@@ -3198,8 +3205,8 @@ class DesktopPet(QWidget):
     def _set_idle_timeout_interactive(self):
         self._touch()
         value, ok = self._get_themed_int(
-            "??????",
-            "????????????",
+            "设置待机时长",
+            "请输入待机秒数",
             int(self._idle_timeout_s),
             5,
             3600,
@@ -3210,7 +3217,7 @@ class DesktopPet(QWidget):
 
         self._idle_timeout_s = int(value)
         _save_env_value("VIVY_IDLE_TIMEOUT", str(self._idle_timeout_s))
-        self._set_status_text(f"???????? {self._idle_timeout_s} ??")
+        self._set_status_text(f"待机时长已设为 {self._idle_timeout_s} 秒。")
 
     def _load_document_for_creative(self):
         self._touch()
