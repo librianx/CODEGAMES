@@ -85,13 +85,6 @@ try:
 except Exception:
     CommandEffect = None
 
-try:
-    from urban_inspiration import UrbanInspirationPanel, generate_inspiration_short, generate_inspiration
-except Exception:
-    UrbanInspirationPanel = None
-    generate_inspiration_short = None
-    generate_inspiration = None
-
 
 CREATIVE_DOC_SUFFIXES = frozenset({".txt", ".md", ".docx", ".pdf"})
 
@@ -99,13 +92,6 @@ IMPROV_SKETCH_MESSAGE = (
     "即兴写一个脑洞小短剧：共 3～8 行，格式为「场景一句」与「角色名：台词」交替；"
     "要有一个无厘头误会，结尾用一句反转或金句收束；不要写作课讲解，不要正式标题以外的套话。"
 )
-
-_FALLBACK_INSPIRATION_POOL = [
-    "地铁玻璃里映出两个人影，其中一个比真人慢了半拍。",
-    "深夜便利店的自动门每隔十分钟自己开一次，但监控里门外没有人。",
-    "一封写给三天后的短信准时送达，而发件箱里并没有发送记录。",
-    "雨停后，天桥上出现一串没有尽头的湿脚印，方向却是通往天空。",
-]
 
 PROJECT_DIR = Path(__file__).resolve().parent
 USER_ID_FILE = PROJECT_DIR / ".desktop_user_id"
@@ -1218,18 +1204,6 @@ class DesktopPet(QWidget):
 
         self.controls_layout.addWidget(self.bubble)
 
-        if UrbanInspirationPanel is not None:
-            self._urban_inspiration_panel = UrbanInspirationPanel(
-                self.controls_wrap,
-                interval_ms=int(os.getenv("VIVY_INSPIRATION_INTERVAL_MS", "30000")),
-            )
-            self._urban_inspiration_panel.hide()
-            self.controls_layout.addWidget(self._urban_inspiration_panel)
-        else:
-            self._urban_inspiration_panel = None
-        self._urban_inspiration_space_added = False
-        self._urban_inspiration_extra_h = int(os.getenv("VIVY_INSPIRATION_PANEL_H", "58"))
-
         self.options_wrap = QFrame()
         self.options_layout = QVBoxLayout(self.options_wrap)
         self.options_layout.setContentsMargins(0, 0, 0, 0)
@@ -1802,22 +1776,6 @@ class DesktopPet(QWidget):
     def _on_worker_error(self, error_msg, callback):
         self._set_busy(False)
         callback(error_msg)
-
-
-    def _safe_generate_inspiration(self) -> str:
-        max_chars = max(28, int(os.getenv("VIVY_INSP_MAX_CHARS", "56")))
-        try:
-            if generate_inspiration is not None:
-                val = (generate_inspiration() or "").strip()
-                if val:
-                    return val
-            if generate_inspiration_short is not None:
-                val = (generate_inspiration_short(max_chars=max_chars) or "").strip()
-                if val:
-                    return val
-        except Exception:
-            pass
-        return random.choice(_FALLBACK_INSPIRATION_POOL)
 
     def _play_overlay_effect(self, effect, text: str, width: int, height: int, margin_top: int, stack_above_command: bool = False):
         if effect is None or self._idle_collapsed:
