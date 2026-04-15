@@ -1,0 +1,155 @@
+<!doctype html><html><head><meta charset='utf-8'>
+<style>
+body { margin: 0; background: #f3f7fb; color: #16222d; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; line-height: 1.72; }
+.page { width: 920px; margin: 26px auto; padding: 52px 66px; background: white; box-shadow: 0 10px 28px rgba(12, 28, 45, .12); }
+h1 { text-align: center; color: #183b63; margin: 0; font-size: 32px; }
+.sub { text-align: center; color: #66798c; margin: 10px 0 36px; }
+h2 { color: #1d4e89; margin-top: 32px; padding-bottom: 6px; border-bottom: 1px solid #d8e3ef; }
+ul { padding-left: 23px; }
+li { margin: 6px 0; }
+img { display: block; max-width: 100%; margin: 14px auto 8px; border-radius: 8px; box-shadow: 0 8px 20px rgba(18, 36, 54, .18); }
+.caption { text-align: center; color: #6a7e91; font-size: 13px; margin-bottom: 10px; }
+.box { background: #f4f8fc; border-left: 4px solid #1d9ed0; padding: 10px 14px; margin: 12px 0; }
+table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+th, td { border: 1px solid #cbd8e5; padding: 8px 10px; text-align: left; }
+th { background: #eaf3fb; color: #183b63; }
+</style></head><body><div class='page'>
+<h1>VIVY 桌宠使用教程</h1>
+<div class='sub'>快速启动｜界面操作｜天气问候｜记忆说明｜打包分发</div>
+<h2>1. 这份教程适合谁</h2>
+<ul>
+<li>适合第一次拿到 VIVY 压缩包的用户，也适合需要给别人演示或分发 VIVY 的人。</li>
+<li>教程按“先跑起来，再会使用，再懂设置，再懂数据安全”的顺序编写。</li>
+<li>如果只是普通使用，重点看第 2 到第 8 节；如果要打包给别人，重点看第 11 节。</li>
+</ul>
+<h2>2. 快速启动</h2>
+<img src='tutorial_assets/startup_flow.png' alt='2. 快速启动'>
+<div class='caption'>startup_flow.png</div>
+<ul>
+<li>Windows：完整解压压缩包后，进入 Windows\VIVY_bundle，双击 start_all.bat。脚本会先启动本地语音服务，再启动桌宠。</li>
+<li>macOS：进入 macOS 文件夹，双击 start_all.command；如果系统拦截，右键该文件后选择“打开”。脚本会进入 VIVY-src 并准备 Python 环境。</li>
+<li>首次启动可能较慢，尤其是需要安装依赖或启动本地语音服务时，请等待窗口出现。</li>
+</ul>
+<div class='box'><strong>使用提示</strong><ul>
+<li>不要直接在压缩包里运行，先完整解压。</li>
+<li>如果双击没有反应，可以用终端/PowerShell 运行 start_all 脚本查看报错。</li>
+</ul></div>
+<h2>3. 第一次配置 API Key</h2>
+<ul>
+<li>首次启动如果没有 .env 或没有 API Key，VIVY 会提示你输入。</li>
+<li>也可以右键桌宠，点击“设置 API Key”，输入 DeepSeek 或 OpenAI 兼容服务的 API Key。</li>
+<li>API Key 会保存到 .env。这个文件是私人配置，打包给别人时不要一起发。</li>
+</ul>
+<div class='box'><strong>常见说法 / 示例</strong><ul>
+<li>如果只是测试界面，不填 API Key 也能启动，但聊天能力可能进入离线兜底。</li>
+<li>如果要使用图片理解，需要额外配置支持视觉的模型。普通文字模型不一定能看图。</li>
+</ul></div>
+<h2>4. 主界面怎么用</h2>
+<img src='tutorial_assets/interface_map.png' alt='4. 主界面怎么用'>
+<div class='caption'>interface_map.png</div>
+<ul>
+<li>左侧气泡区显示 Vivy 的回复、状态提示、天气问候和灵感内容。</li>
+<li>底部输入区可以输入文字，按回车或点击“发送”提交；图片按钮可附加图片；语音按钮可启动语音输入。</li>
+<li>快捷按钮包括今日灵感、脑洞短剧、换个问题、形态切换、兴趣反馈等。</li>
+<li>双击桌宠可以展开或收起；按住左键拖动可以移动位置；右键打开设置菜单。</li>
+</ul>
+<h2>5. 日常聊天与本地快捷能力</h2>
+<img src='tutorial_assets/message_flow.png' alt='5. 日常聊天与本地快捷能力'>
+<div class='caption'>message_flow.png</div>
+<ul>
+<li>VIVY 会先判断本地能力：时间查询、天气查询、唱歌/停止唱歌等会直接处理，不必请求大模型。</li>
+<li>普通聊天、创作交流、复杂问题会进入后端 API，读取记忆和运行时上下文后再请求模型。</li>
+<li>新的问题会中断旧回复和旧语音，避免多个回答串在一起。</li>
+</ul>
+<div class='box'><strong>常见说法 / 示例</strong><ul>
+<li>问时间：现在几点？今天几号？</li>
+<li>问天气：今天会下雨吗？上海明天几度？</li>
+<li>普通聊天：帮我想一个故事开头。</li>
+</ul></div>
+<h2>6. 天气、位置与每日问候</h2>
+<img src='tutorial_assets/daily_greeting_flow.png' alt='6. 天气、位置与每日问候'>
+<div class='caption'>daily_greeting_flow.png</div>
+<ul>
+<li>右键桌宠可以设置当前位置。这个城市会作为天气查询和早晨问候的默认城市。</li>
+<li>右键菜单可以开启或关闭 IP 粗定位。IP 粗定位只用于天气，不做后台持续定位。</li>
+<li>每天第一次打开会触发一次问候；早、中、晚、深夜也有自动问候时间点。</li>
+<li>VIVY 会把当天打开次数和已问候时段写入记忆，因此关闭后重新打开不会重复第一次问候。</li>
+</ul>
+<div class='box'><strong>使用提示</strong><ul>
+<li>如果不想自动问候，可以右键关闭“每日问候”。</li>
+<li>早晨问候会包含天气和出门防护提醒；其他时段主要是陪伴式问候。</li>
+</ul></div>
+<h2>7. 情绪陪伴与唱歌</h2>
+<ul>
+<li>现在 VIVY 不会因为你说“难过、心情不好、想哭”就立刻唱歌。</li>
+<li>轻度低落时，VIVY 会先安慰；明显难过时，VIVY 会先陪伴并询问要不要听歌。</li>
+<li>只有你明确说“唱首歌、想听你唱、唱吧、好”等，才会播放 song 文件夹里的 WAV 歌曲。</li>
+<li>如果说“停止唱歌、别唱了、停歌”，VIVY 会停止当前歌曲。</li>
+</ul>
+<div class='box'><strong>常见说法 / 示例</strong><ul>
+<li>不会直接唱：我今天好难过。</li>
+<li>会进入邀请：我有点想哭。</li>
+<li>会唱：唱首歌给我听。 / 唱吧。</li>
+</ul></div>
+<h2>8. 创作模式与沉浸写作</h2>
+<ul>
+<li>点击“形态：普通/创作”可以在普通陪伴模式和创作模式之间切换。</li>
+<li>创作模式下可以读取 txt、md、docx、pdf 文件，让 Vivy 基于文档进行分析或辅助创作。</li>
+<li>右键菜单或创作按钮可以打开“沉浸写作窗口”，适合长文本写作。</li>
+<li>沉浸写作支持新建、打开、保存、全屏、目标字数、润色、续写、点评、加强和自定义指令。</li>
+</ul>
+<div class='box'><strong>使用提示</strong><ul>
+<li>读取文档前，建议先确认文档不是过大的扫描版 PDF。</li>
+<li>长文写作时记得定期保存；自动备份文件是 .vivy_immersive_autosave.md。</li>
+</ul></div>
+<h2>9. 记忆模块怎么理解</h2>
+<img src='tutorial_assets/memory_model.png' alt='9. 记忆模块怎么理解'>
+<div class='caption'>memory_model.png</div>
+<ul>
+<li>VIVY 的记忆主要保存在 vivy.sqlite 中，包含用户偏好、摘要、最近对话回合和每日问候状态。</li>
+<li>记忆面板里的 preferences JSON 是结构化偏好，必须保持合法 JSON，否则保存会失败。</li>
+<li>daily_greeting_state 会记录每天 open_count、open_greeted、slots 等状态，用来避免重复问候。</li>
+<li>重置本机用户 ID 会开启一套新的本机身份，相当于从新的记忆开始。</li>
+</ul>
+<h2>10. 右键菜单速查</h2>
+<ul>
+<li>设置 API Key：修改模型接口凭证。</li>
+<li>设置当前位置：修改天气默认城市。</li>
+<li>开启/关闭 IP 粗定位：控制是否允许用 IP 推断城市。</li>
+<li>开启/关闭每日问候：控制自动问候功能。</li>
+<li>显示/隐藏记忆模块：控制记忆编辑面板。</li>
+<li>设置待机时长：设置无操作多久后收起。</li>
+<li>读取文档、清除参考、沉浸写作窗口：创作辅助入口。</li>
+<li>停止唱歌、退出 VIVY：控制播放和关闭程序。</li>
+</ul>
+<h2>11. 打包给别人时怎么保持干净</h2>
+<img src='tutorial_assets/distribution_safety.png' alt='11. 打包给别人时怎么保持干净'>
+<div class='caption'>distribution_safety.png</div>
+<ul>
+<li>如果把 VIVY 压缩包发给别人，建议不要带自己的记忆文件和私人配置。</li>
+<li>必须排除：vivy.sqlite、.desktop_user_id、.env。</li>
+<li>建议排除：.vivy_immersive_autosave.md、.immersive_recent.json。</li>
+<li>可以保留：env.example、song 文件夹、static 资源、启动脚本、exe 或 macOS 源码启动包。</li>
+<li>这样别人第一次运行会生成新的用户 ID 和新的数据库，不会继承你的记忆。</li>
+</ul>
+<h2>12. 常见问题排查</h2>
+<img src='tutorial_assets/troubleshooting_tree.png' alt='12. 常见问题排查'>
+<div class='caption'>troubleshooting_tree.png</div>
+<ul>
+<li>启动失败：先确认是否完整解压，再用 start_all 脚本在终端中运行查看错误。</li>
+<li>不能聊天：检查 API Key 是否配置，网络是否可访问模型服务。</li>
+<li>天气查不到：先右键设置当前位置，城市名尽量写清楚，例如“上海市”“茂名市”。</li>
+<li>没有自动问候：检查每日问候开关；当天已问候过也不会重复播报。</li>
+<li>不能唱歌：确认 song 文件夹里有可播放的 WAV 文件。</li>
+<li>图片理解无效：确认配置了支持视觉的模型。</li>
+</ul>
+<h2>附录：建议保留与排除的文件</h2>
+<table><tr><th>类别</th><th>文件</th><th>说明</th></tr>
+<tr><td>可保留</td><td>env.example</td><td>示例配置，不包含私人 API Key。</td></tr>
+<tr><td>可保留</td><td>song 文件夹</td><td>放 WAV 歌曲，用于唱歌功能。</td></tr>
+<tr><td>应排除</td><td>.env</td><td>包含 API Key 等私人配置。</td></tr>
+<tr><td>应排除</td><td>vivy.sqlite</td><td>包含你的记忆、偏好和对话记录。</td></tr>
+<tr><td>应排除</td><td>.desktop_user_id</td><td>你的本机用户 ID。</td></tr>
+<tr><td>建议排除</td><td>.vivy_immersive_autosave.md</td><td>沉浸写作自动备份。</td></tr>
+<tr><td>建议排除</td><td>.immersive_recent.json</td><td>最近打开文件记录。</td></tr>
+</table></div></body></html>

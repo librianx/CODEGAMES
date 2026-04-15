@@ -4,10 +4,15 @@ import re
 import uuid
 import threading
 import time
-from datetime import date, datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 import json
 import base64
+import requests
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - Python versions without zoneinfo
+    ZoneInfo = None
 
 from flask import Flask, jsonify, request, Response, stream_with_context
 from dotenv import load_dotenv
@@ -43,6 +48,17 @@ from prompts import (
     VIVY_SYSTEM_PROMPT,
 )
 from questions import QUESTION_BANK, pick_random_question
+from weather_service import (
+    build_missing_city_greeting,
+    build_morning_weather_greeting,
+    build_non_weather_greeting,
+    choose_location,
+    fetch_weather,
+    geocode_city,
+    is_weather_query,
+    normalize_city,
+    query_weather_for_message,
+)
 
 
 load_dotenv()
@@ -52,7 +68,121 @@ app = Flask(__name__)
 
 
 def _today_str() -> str:
-    return date.today().isoformat()
+    return _current_datetime()[0].date().isoformat()
+
+
+def _current_datetime():
+    tz_name = (os.getenv("VIVY_TIMEZONE") or "").strip()
+    if tz_name and ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(tz_name)), tz_name
+        except Exception:
+            pass
+    return datetime.now().astimezone(), ""
+
+
+def _weekday_cn(dt: datetime) -> str:
+    return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][dt.weekday()]
+
+
+def _daypart_cn(hour: int) -> str:
+    if 5 <= hour < 8:
+        return "清晨"
+    if 8 <= hour < 12:
+        return "上午"
+    if 12 <= hour < 14:
+        return "中午"
+    if 14 <= hour < 18:
+        return "下午"
+    if 18 <= hour < 23:
+        return "晚上"
+    return "深夜"
+
+
+def _timezone_label(dt: datetime, configured_tz: str = "") -> str:
+    offset = dt.strftime("%z")
+    if offset:
+        offset = f"UTC{offset[:3]}:{offset[3:]}"
+    tz = configured_tz or dt.tzname() or "本地"
+    return f"{tz} / {offset}" if offset else tz
+
+
+def _build_runtime_context() -> str:
+    now, configured_tz = _current_datetime()
+    return "\n".join(
+        [
+            f"- 当前本地日期：{now.strftime('%Y-%m-%d')}",
+            f"- 当前本地时间：{now.strftime('%H:%M')}",
+            f"- 星期：{_weekday_cn(now)}",
+            f"- 时区：{_timezone_label(now, configured_tz)}",
+            f"- 时间段：{_daypart_cn(now.hour)}",
+            "- 使用原则：这是运行桌宠这台电脑的当前时间，只用于本轮对话，不写入长期记忆。",
+        ]
+    )
+
+
+def _is_time_query(message: str) -> bool:
+    text = (message or "").strip()
+    lower = text.lower()
+    compact = re.sub(r"\s+", "", lower)
+    direct_queries = {
+        "时间",
+        "几点",
+        "几点了",
+        "现在几点",
+        "现在几点了",
+        "现在时间",
+        "当前时间",
+        "今天几号",
+        "今天日期",
+        "今天周几",
+        "今天星期几",
+        "明天几号",
+        "明天日期",
+        "明天周几",
+        "明天星期几",
+        "昨天几号",
+        "昨天日期",
+        "昨天周几",
+        "昨天星期几",
+    }
+    if compact in direct_queries:
+        return True
+    patterns = [
+        r"(现在|当前|此刻).*(几点|时间|几号|日期|周几|星期几)",
+        r"(今天|明天|昨天).*(几号|日期|周几|星期几)",
+        r"(几点|几点了|现在时间|当前时间)",
+    ]
+    return any(re.search(pattern, compact) for pattern in patterns)
+
+
+def _current_time_reply(message: str = "") -> str:
+    now, configured_tz = _current_datetime()
+    compact = re.sub(r"\s+", "", (message or "").strip().lower())
+    target = now
+    label = "现在"
+    if "明天" in compact:
+        target = now + timedelta(days=1)
+        label = "明天"
+    elif "昨天" in compact:
+        target = now - timedelta(days=1)
+        label = "昨天"
+    elif "今天" in compact:
+        label = "今天"
+
+    asks_date_only = any(k in compact for k in ("几号", "日期", "周几", "星期几")) and not any(
+        k in compact for k in ("几点", "时间")
+    )
+    if asks_date_only:
+        return (
+            f"{label}是 {target.strftime('%Y-%m-%d')} {_weekday_cn(target)}"
+            f"（{_timezone_label(now, configured_tz)}）。"
+        )
+
+    return (
+        f"现在是 {now.strftime('%Y-%m-%d')} {_weekday_cn(now)} "
+        f"{now.strftime('%H:%M')}（{_timezone_label(now, configured_tz)}，{_daypart_cn(now.hour)}）。"
+    )
 
 
 def _json_response(payload, status=200):
@@ -459,6 +589,7 @@ def _chat_with_llm(
         summary=summary or "",
         summary_long=(summary_long or ""),
         memory_snippets=memory_snippets,
+        runtime_context=_build_runtime_context(),
         user_message=(
             user_message
             + ("\n\n[兴趣信号]\n" + interest_hint if interest_hint else "")
@@ -598,6 +729,7 @@ def _chat_with_llm_stream(
         summary=summary or "",
         summary_long=(summary_long or ""),
         memory_snippets=memory_snippets,
+        runtime_context=_build_runtime_context(),
         user_message=(
             user_message
             + ("\n\n[兴趣信号]\n" + interest_hint if interest_hint else "")
@@ -731,6 +863,313 @@ def api_memory_delete_turn():
         return _json_response({"error": "turn not found"}, 404)
 
     return _json_response({"ok": True, "turn_id": tid})
+
+
+def _weather_greeting_done_map(prefs: Dict[str, Any]) -> Dict[str, List[str]]:
+    raw = prefs.get("weather_greeting_done")
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for day, slots in raw.items():
+        if isinstance(slots, list):
+            out[str(day)] = [str(s) for s in slots]
+    return out
+
+
+def _mark_weather_greeting_done(user_id: str, prefs: Dict[str, Any], day: str, slot: str):
+    done = _weather_greeting_done_map(prefs)
+    slots = set(done.get(day) or [])
+    slots.add(slot)
+    done[day] = sorted(slots)
+    # Keep only recent days to avoid unbounded preference growth.
+    keep_days = sorted(done.keys())[-7:]
+    done = {d: done[d] for d in keep_days}
+    update_user_preferences(user_id, {"weather_greeting_done": done})
+
+
+def _daily_greeting_state_map(prefs: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw = prefs.get("daily_greeting_state")
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for day, item in raw.items():
+            if not isinstance(item, dict):
+                continue
+            slots = item.get("slots") or []
+            open_ids = item.get("open_event_ids") or []
+            try:
+                open_count = int(item.get("open_count") or 0)
+            except Exception:
+                open_count = 0
+            out[str(day)] = {
+                "open_count": max(0, open_count),
+                "open_greeted": bool(item.get("open_greeted")),
+                "slots": sorted({str(s) for s in slots if str(s)}),
+                "open_event_ids": [str(x) for x in open_ids if str(x)][-30:],
+            }
+
+    legacy_done = _weather_greeting_done_map(prefs)
+    for day, slots in legacy_done.items():
+        entry = out.setdefault(
+            str(day),
+            {"open_count": 0, "open_greeted": False, "slots": [], "open_event_ids": []},
+        )
+        entry["slots"] = sorted(set(entry.get("slots") or []) | {str(s) for s in slots})
+    return out
+
+
+def _daily_greeting_entry(state: Dict[str, Dict[str, Any]], day: str) -> Dict[str, Any]:
+    entry = state.setdefault(
+        day,
+        {"open_count": 0, "open_greeted": False, "slots": [], "open_event_ids": []},
+    )
+    entry["slots"] = sorted({str(s) for s in (entry.get("slots") or []) if str(s)})
+    entry["open_event_ids"] = [str(x) for x in (entry.get("open_event_ids") or []) if str(x)][-30:]
+    try:
+        entry["open_count"] = max(0, int(entry.get("open_count") or 0))
+    except Exception:
+        entry["open_count"] = 0
+    entry["open_greeted"] = bool(entry.get("open_greeted"))
+    return entry
+
+
+def _trim_daily_greeting_state(state: Dict[str, Dict[str, Any]], keep: int = 14) -> Dict[str, Dict[str, Any]]:
+    keep_days = sorted(state.keys())[-keep:]
+    return {d: state[d] for d in keep_days}
+
+
+def _legacy_done_from_daily_state(state: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    for day, entry in state.items():
+        slots = sorted({str(s) for s in (entry.get("slots") or []) if str(s)})
+        if slots:
+            out[str(day)] = slots
+    return out
+
+
+def _save_daily_greeting_state(user_id: str, state: Dict[str, Dict[str, Any]]):
+    state = _trim_daily_greeting_state(state)
+    update_user_preferences(
+        user_id,
+        {
+            "daily_greeting_state": state,
+            # Keep the older field in sync so existing debug views and older builds still understand slots.
+            "weather_greeting_done": _legacy_done_from_daily_state(state),
+        },
+    )
+
+
+@app.post("/api/weather/greeting")
+def api_weather_greeting():
+    data = request.get_json(force=True) or {}
+    user_id = str(data.get("user_id") or "").strip()
+    slot = str(data.get("slot") or "").strip().lower()
+    trigger = str(data.get("trigger") or "schedule").strip().lower()
+    open_event_id = str(data.get("open_event_id") or "").strip()
+    force = bool(data.get("force"))
+    if not user_id:
+        return _json_response({"error": "missing user_id"}, 400)
+    if slot not in ("morning", "noon", "evening", "late_night"):
+        return _json_response({"error": "invalid slot"}, 400)
+    if trigger not in ("open", "schedule"):
+        return _json_response({"error": "invalid trigger"}, 400)
+
+    ensure_user(user_id)
+    row = get_user(user_id)
+    prefs = parse_preferences(row) if row is not None else {}
+    today = _today_str()
+    state = _daily_greeting_state_map(prefs)
+    entry = _daily_greeting_entry(state, today)
+    state_changed = False
+
+    if trigger == "open":
+        seen_ids = set(entry.get("open_event_ids") or [])
+        if open_event_id:
+            if open_event_id not in seen_ids:
+                entry["open_count"] = int(entry.get("open_count") or 0) + 1
+                entry["open_event_ids"] = (entry.get("open_event_ids") or []) + [open_event_id]
+                entry["open_event_ids"] = entry["open_event_ids"][-30:]
+                state_changed = True
+        else:
+            entry["open_count"] = int(entry.get("open_count") or 0) + 1
+            state_changed = True
+
+    greeting_enabled_default = os.getenv("VIVY_WEATHER_GREETING_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    if prefs.get("weather_greeting_enabled", greeting_enabled_default) is False:
+        if state_changed:
+            _save_daily_greeting_state(user_id, state)
+        return _json_response(
+            {
+                "ok": True,
+                "disabled": True,
+                "already_done": False,
+                "trigger": trigger,
+                "slot": slot,
+                "open_count": entry.get("open_count", 0),
+                "state_changed": state_changed,
+            }
+        )
+
+    already_done = bool(entry.get("open_greeted")) if trigger == "open" else slot in set(entry.get("slots") or [])
+    if (not force) and already_done:
+        if state_changed:
+            _save_daily_greeting_state(user_id, state)
+        return _json_response(
+            {
+                "ok": True,
+                "already_done": True,
+                "trigger": trigger,
+                "slot": slot,
+                "open_count": entry.get("open_count", 0),
+                "state_changed": state_changed,
+            }
+        )
+
+    need_city = False
+    if slot == "morning":
+        try:
+            decision = choose_location(prefs, "今天的天气和出门防护建议")
+            if decision.get("ok"):
+                city = decision["city"]
+                country = str(prefs.get("weather_default_country") or os.getenv("VIVY_DEFAULT_COUNTRY") or "CN")
+                location = geocode_city(city, country=country)
+                if location:
+                    location["source"] = decision.get("source") or location.get("source")
+                    weather = fetch_weather(location, days=3)
+                    reply = build_morning_weather_greeting(user_id, today, location, weather)
+                else:
+                    need_city = True
+                    reply = build_missing_city_greeting(slot, user_id, today)
+            else:
+                need_city = True
+                reply = build_missing_city_greeting(slot, user_id, today)
+        except requests.RequestException:
+            reply = "\n".join(
+                [
+                    build_non_weather_greeting("morning", user_id, today).split("\n")[0],
+                    "今天我没能拿到天气数据，可能是网络或天气服务暂时不可用。",
+                    "出门前还是看一眼窗外，伞和水都可以放近一点。",
+                ]
+            )
+        except Exception:
+            reply = build_missing_city_greeting(slot, user_id, today)
+            need_city = True
+    else:
+        reply = build_non_weather_greeting(slot, user_id, today)
+
+    slots = set(entry.get("slots") or [])
+    slots.add(slot)
+    entry["slots"] = sorted(slots)
+    if trigger == "open":
+        entry["open_greeted"] = True
+    _save_daily_greeting_state(user_id, state)
+    if reply:
+        _record_assistant_text(user_id, reply, None)
+        log_interaction(user_id, topic="每日问候", sentiment=f"{trigger}:{slot}", content=reply[:200])
+
+    return _json_response(
+        {
+            "ok": True,
+            "already_done": False,
+            "trigger": trigger,
+            "slot": slot,
+            "reply": reply,
+            "need_city": need_city,
+            "open_count": entry.get("open_count", 0),
+            "state_changed": True,
+        }
+    )
+
+
+@app.post("/api/weather/location")
+def api_weather_location():
+    data = request.get_json(force=True) or {}
+    user_id = (data.get("user_id") or "").strip()
+    if not user_id:
+        return _json_response({"error": "missing user_id"}, 400)
+
+    ensure_user(user_id)
+    patch: Dict[str, Any] = {}
+
+    if "city" in data:
+        city = normalize_city(str(data.get("city") or ""))
+        if not city:
+            return _json_response({"error": "city cannot be empty"}, 400)
+        patch["weather_default_city"] = city
+        patch["weather_location_source"] = "manual"
+
+    if "auto_location" in data:
+        patch["weather_auto_location"] = bool(data.get("auto_location"))
+
+    if not patch:
+        return _json_response({"error": "missing city or auto_location"}, 400)
+
+    update_user_preferences(user_id, patch)
+    row = get_user(user_id)
+    prefs = parse_preferences(row) if row is not None else {}
+    city = prefs.get("weather_default_city") or ""
+    auto = bool(prefs.get("weather_auto_location"))
+
+    parts = []
+    if "weather_default_city" in patch:
+        parts.append(f"当前位置已设为 {city}")
+    if "weather_auto_location" in patch:
+        parts.append(f"IP 粗定位已{'开启' if auto else '关闭'}")
+    reply = "，".join(parts) + "。"
+    return _json_response({"ok": True, "preferences": prefs, "reply": reply})
+
+
+@app.post("/api/weather")
+def api_weather():
+    data = request.get_json(force=True) or {}
+    user_id = (data.get("user_id") or "").strip()
+    message = (data.get("message") or "").strip()
+    city = (data.get("city") or "").strip()
+    allow_ip_location = bool(data.get("allow_ip_location"))
+
+    if not user_id:
+        return _json_response({"error": "missing user_id"}, 400)
+    if not message and not city:
+        return _json_response({"error": "missing message or city"}, 400)
+
+    ensure_user(user_id)
+    row = get_user(user_id)
+    prefs = parse_preferences(row) if row is not None else {}
+
+    if message and not is_weather_query(message) and not city:
+        return _json_response(
+            {"ok": False, "reply": "这不像天气问题。你可以问我“今天会下雨吗”或“上海明天几度”。"},
+            400,
+        )
+
+    try:
+        result = query_weather_for_message(
+            user_prefs=prefs,
+            message=message,
+            explicit_city=city,
+            allow_ip_location=allow_ip_location,
+        )
+    except requests.RequestException:
+        result = {
+            "ok": False,
+            "reply": "我现在没拿到天气数据，可能是网络或天气服务暂时不可用。稍后再试一次就好。",
+        }
+    except Exception as e:
+        result = {
+            "ok": False,
+            "reply": f"天气查询失败：{e}",
+        }
+
+    reply = result.get("reply") or ""
+    if reply:
+        _record_assistant_text(user_id, reply, None)
+    log_interaction(user_id, topic="天气查询", sentiment="neutral", content=(message or city)[:120])
+    return _json_response(result)
 
 
 @app.post("/api/init")
@@ -890,11 +1329,8 @@ def api_message():
         return _json_response({"user_id": user_id, "messages": messages})
 
     # 2.5) 直接回答本地时间（避免模型瞎猜时区/DST 导致快一小时）
-    if ("几点" in message) or ("现在时间" in message) or (lower.strip() in ("时间", "几点了", "现在几点")):
-        now = datetime.now().astimezone()
-        timestr = now.strftime("%H:%M")
-        tz = now.strftime("%Z") or "本地"
-        reply = f"现在是 {timestr}（{tz}）。"
+    if _is_time_query(message):
+        reply = _current_time_reply(message)
         messages.append({"type": "chat", "text": reply})
         _record_assistant_text(user_id, reply, chat_mode)
         log_interaction(user_id, topic="时间查询", sentiment="neutral", content=message[:80])
@@ -973,6 +1409,18 @@ def api_message_stream():
     if chat_mode in ("chat", "creative"):
         update_user_preferences(user_id, {"chat_mode": chat_mode})
         log_interaction(user_id, topic="形态切换", sentiment=chat_mode, content=message[:200])
+
+    if _is_time_query(message):
+        reply = _current_time_reply(message)
+        _record_assistant_text(user_id, reply, chat_mode)
+        log_interaction(user_id, topic="时间查询", sentiment="neutral", content=message[:80])
+
+        def gen_time():
+            payload = json.dumps({"delta": reply}, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+            yield "data: {\"done\": true}\n\n"
+
+        return Response(stream_with_context(gen_time()), mimetype="text/event-stream")
 
     def gen():
         full = ""

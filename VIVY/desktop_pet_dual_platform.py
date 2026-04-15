@@ -8,6 +8,8 @@ import math
 import random
 import base64
 import mimetypes
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 import inspect
 
@@ -79,6 +81,7 @@ from app import app as flask_app
 from db import init_db
 from creative_assist import OFFICE_CONTEXT_MAX, OFFICE_PASSAGE_MAX, load_document_text
 from speech_dual_platform import set_speech_token, speak_text_async, stop_speaking, trigger_system_voice_dictation
+from weather_service import is_weather_query
 
 try:
     from command_effect_stable import CommandEffect
@@ -103,11 +106,105 @@ SONG_DIR = PROJECT_DIR / "song"
 SONG_SUFFIXES = {".wav"}
 SING_TRIGGER_KEYWORDS = (
     "唱歌", "唱首歌", "唱一首", "给我唱", "你唱", "来首歌", "来一首歌",
-    "放首歌", "播放歌曲", "哄我", "安慰我", "我心情不好", "我很难过"
+    "放首歌", "播放歌曲", "想听你唱", "想听歌", "唱给我听"
+)
+SONG_OFFER_ACCEPT_KEYWORDS = (
+    "好", "好啊", "可以", "嗯", "嗯嗯", "唱吧", "你唱吧", "唱给我听",
+    "想听", "我想听", "来吧", "那你唱", "唱一首吧", "唱首歌吧"
+)
+SONG_OFFER_REJECT_KEYWORDS = (
+    "不用", "先不用", "不要", "不想听", "别唱", "算了", "不用唱", "先别唱"
 )
 STOP_SONG_TRIGGER_KEYWORDS = ("停止唱歌", "别唱了", "停歌", "停止播放", "暂停歌曲")
+SONG_OFFER_TTL_S = 120
+SONG_OFFER_COOLDOWN_S = 600
 IMMERSIVE_AUTOSAVE_PATH = PROJECT_DIR / ".vivy_immersive_autosave.md"
 IMMERSIVE_RECENT_FILE = PROJECT_DIR / ".immersive_recent.json"
+
+
+def _weekday_cn(dt: datetime) -> str:
+    return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][dt.weekday()]
+
+
+def _daypart_cn(hour: int) -> str:
+    if 5 <= hour < 8:
+        return "清晨"
+    if 8 <= hour < 12:
+        return "上午"
+    if 12 <= hour < 14:
+        return "中午"
+    if 14 <= hour < 18:
+        return "下午"
+    if 18 <= hour < 23:
+        return "晚上"
+    return "深夜"
+
+
+def _timezone_label(dt: datetime) -> str:
+    offset = dt.strftime("%z")
+    if offset:
+        offset = f"UTC{offset[:3]}:{offset[3:]}"
+    tz = dt.tzname() or "本地"
+    return f"{tz} / {offset}" if offset else tz
+
+
+def _is_local_time_query(message: str) -> bool:
+    compact = re.sub(r"\s+", "", (message or "").strip().lower())
+    direct_queries = {
+        "时间",
+        "几点",
+        "几点了",
+        "现在几点",
+        "现在几点了",
+        "现在时间",
+        "当前时间",
+        "今天几号",
+        "今天日期",
+        "今天周几",
+        "今天星期几",
+        "明天几号",
+        "明天日期",
+        "明天周几",
+        "明天星期几",
+        "昨天几号",
+        "昨天日期",
+        "昨天周几",
+        "昨天星期几",
+    }
+    if compact in direct_queries:
+        return True
+    patterns = [
+        r"(现在|当前|此刻).*(几点|时间|几号|日期|周几|星期几)",
+        r"(今天|明天|昨天).*(几号|日期|周几|星期几)",
+        r"(几点|几点了|现在时间|当前时间)",
+    ]
+    return any(re.search(pattern, compact) for pattern in patterns)
+
+
+def _build_local_time_reply(message: str = "") -> str:
+    now = datetime.now().astimezone()
+    compact = re.sub(r"\s+", "", (message or "").strip().lower())
+    target = now
+    label = "现在"
+    if "明天" in compact:
+        target = now + timedelta(days=1)
+        label = "明天"
+    elif "昨天" in compact:
+        target = now - timedelta(days=1)
+        label = "昨天"
+    elif "今天" in compact:
+        label = "今天"
+
+    asks_date_only = any(k in compact for k in ("几号", "日期", "周几", "星期几")) and not any(
+        k in compact for k in ("几点", "时间")
+    )
+    if asks_date_only:
+        return f"{label}是 {target.strftime('%Y-%m-%d')} {_weekday_cn(target)}（{_timezone_label(now)}）。"
+
+    return (
+        f"现在是 {now.strftime('%Y-%m-%d')} {_weekday_cn(now)} "
+        f"{now.strftime('%H:%M')}（{_timezone_label(now)}，{_daypart_cn(now.hour)}）。"
+    )
 
 
 def _immersive_load_recent(max_n: int = 10) -> list[str]:
@@ -591,6 +688,11 @@ class CreativeAvatarDock(QWidget):
             max(self._label.minimumWidth(), sh.width()) + self._pad * 2,
             max(self._label.minimumHeight(), sh.height()) + self._pad * 2 + extra,
         )
+
+
+class _AvatarActionPlaceholder(QWidget):
+    def sizeHint(self):
+        return QSize(0, 0)
 
 
 class ImmersiveWritingWindow(QWidget):
@@ -1135,6 +1237,9 @@ class DesktopPet(QWidget):
         # local song player
         self._song_is_playing = False
         self._pending_song_path: Path | None = None
+        self._pending_song_offer_until = 0.0
+        self._last_song_offer_ts = 0.0
+        self._song_effect = None
         self._song_delay_timer = QTimer(self)
         self._song_delay_timer.setSingleShot(True)
         self._song_delay_timer.timeout.connect(self._play_pending_song_now)
@@ -1143,6 +1248,8 @@ class DesktopPet(QWidget):
         self._idle_collapsed = False
         self._last_interaction_ts = time.time()
         self._idle_timeout_s = int(os.getenv("VIVY_IDLE_TIMEOUT", "18"))
+        self._greeting_inflight_slots = set()
+        self._open_event_id = str(uuid.uuid4())
         self._expanded_size = QSize(620, 332)
         self._expanded_size_with_memory = QSize(784, 348)
         self._collapsed_size = QSize(292, 302)
@@ -1156,6 +1263,7 @@ class DesktopPet(QWidget):
         self._build_ui()
         self._init_session()
         self._start_idle_watch()
+        self._start_greeting_watch()
 
     def _build_ui(self):
         self.setWindowTitle("VIVY 桌宠")
@@ -1220,11 +1328,11 @@ class DesktopPet(QWidget):
         self.image_label.setStyleSheet("background: transparent;")
         self._setup_avatar()
 
-        self.creative_actions = QWidget()
+        self.creative_actions = QFrame()
         self.creative_actions.setObjectName("creativeDomainActions")
         ca_outer = QVBoxLayout(self.creative_actions)
-        ca_outer.setContentsMargins(2, 0, 2, 0)
-        ca_outer.setSpacing(3)
+        ca_outer.setContentsMargins(2, 4, 2, 0)
+        ca_outer.setSpacing(6)
         ca_row1 = QHBoxLayout()
         ca_row1.setSpacing(4)
         ca_row2 = QHBoxLayout()
@@ -1274,8 +1382,10 @@ class DesktopPet(QWidget):
         self.domain_aura = CreativeDomainEffects()
         self.domain_aura.intro_finished.connect(self._on_creative_domain_intro_finished)
 
+        self._avatar_action_placeholder = _AvatarActionPlaceholder()
+        self._avatar_action_placeholder.hide()
         self.avatar_dock = CreativeAvatarDock(
-            self.domain_aura, self.image_label, self.creative_actions
+            self.domain_aura, self.image_label, self._avatar_action_placeholder
         )
         self.avatar_dock.setMinimumWidth(150 + 48)
         self.avatar_dock.setMaximumWidth(220 + 48)
@@ -1370,6 +1480,9 @@ class DesktopPet(QWidget):
         interest_row = QHBoxLayout()
         interest_row.setSpacing(6)
         self.interest_label = QLabel("兴趣：未选择")
+        self.interest_label.setObjectName("interestBadge")
+        self.interest_label.setMinimumWidth(110)
+        self.interest_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         interest_row.addWidget(self.interest_label)
 
         self.btn_interest_yes = QPushButton("感兴趣")
@@ -1388,6 +1501,7 @@ class DesktopPet(QWidget):
         # Keep the input box at the bottom of the chat area.
         self.controls_layout.addStretch(1)
         self.controls_layout.addLayout(input_row)
+        self.controls_layout.addWidget(self.creative_actions)
 
         self.memory_wrap = QFrame()
         self.memory_wrap.setObjectName("memoryWrap")
@@ -1542,12 +1656,22 @@ class DesktopPet(QWidget):
             }
             #creativeDomainActions {
                 background: transparent;
+                border: 0;
             }
             #vivyDomainBtn {
                 font-size: 10px;
-                padding: 2px 5px;
-                min-height: 20px;
-                max-height: 24px;
+                padding: 4px 8px;
+                min-height: 24px;
+                max-height: 28px;
+            }
+            #interestBadge {
+                background: rgba(39, 160, 209, 150);
+                border: 1px solid rgba(121, 228, 255, 165);
+                border-radius: 8px;
+                color: #eefbff;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 10px;
             }
             """
         )
@@ -2219,13 +2343,40 @@ class DesktopPet(QWidget):
         self.current_interest_signal = signal or ""
         if self.current_interest_signal == "interested":
             self.interest_label.setText("兴趣：感兴趣")
+            self.interest_label.setStyleSheet(
+                "background: rgba(49, 183, 132, 170);"
+                " border: 1px solid rgba(146, 255, 214, 180);"
+                " border-radius: 8px;"
+                " color: #f2fffb;"
+                " font-size: 11px;"
+                " font-weight: 600;"
+                " padding: 4px 10px;"
+            )
         elif self.current_interest_signal == "not_interested":
             self.interest_label.setText("兴趣：不感兴趣")
+            self.interest_label.setStyleSheet(
+                "background: rgba(207, 120, 84, 168);"
+                " border: 1px solid rgba(255, 199, 173, 185);"
+                " border-radius: 8px;"
+                " color: #fff7f3;"
+                " font-size: 11px;"
+                " font-weight: 600;"
+                " padding: 4px 10px;"
+            )
         else:
             self.interest_label.setText("兴趣：未选择")
+            self.interest_label.setStyleSheet(
+                "background: rgba(39, 160, 209, 150);"
+                " border: 1px solid rgba(121, 228, 255, 165);"
+                " border-radius: 8px;"
+                " color: #eefbff;"
+                " font-size: 11px;"
+                " font-weight: 600;"
+                " padding: 4px 10px;"
+            )
 
     def _sync_avatar_dock_heights(self):
-        extra = 58 if self.chat_mode == "creative" else 0
+        extra = 0
         self.avatar_dock.setMinimumHeight(230 + extra)
         self.avatar_dock.setMaximumHeight(300 + extra)
         self._apply_window_size()
@@ -2234,7 +2385,7 @@ class DesktopPet(QWidget):
         if self.chat_mode != "creative":
             return
         self.creative_actions.show()
-        self.avatar_dock.updateGeometry()
+        self.controls_wrap.updateGeometry()
         if not self._use_button_opacity_fx:
             QTimer.singleShot(0, self._start_command_effect_if_needed)
             return
@@ -2511,6 +2662,92 @@ class DesktopPet(QWidget):
         _save_env_value("DEEPSEEK_API_KEY", new_key)
         self._set_status_text("API Key 已保存，后续请求将使用新配置。")
 
+    def _current_memory_preferences(self) -> dict:
+        try:
+            return json.loads((self.memory_prefs.toPlainText() or "{}").strip() or "{}")
+        except Exception:
+            return {}
+
+    def _set_weather_city_interactive(self):
+        self._touch()
+        prefs = self._current_memory_preferences()
+        current = str(prefs.get("weather_default_city") or os.getenv("VIVY_DEFAULT_CITY") or "").strip()
+        city, ok = QInputDialog.getText(
+            self,
+            "设置当前位置",
+            "请输入你当前所在城市（用于天气查询）：",
+            QLineEdit.EchoMode.Normal,
+            current,
+        )
+        if not ok:
+            return
+        city = (city or "").strip()
+        if not city:
+            QMessageBox.warning(self, "提示", "当前位置不能为空。")
+            return
+
+        def _request():
+            return self._request_json("/api/weather/location", {"user_id": self.user_id, "city": city})
+
+        def _ok(data):
+            self._set_status_text(data.get("reply") or f"当前位置已设为 {city}。")
+            self._refresh_memory(silent=True)
+
+        def _err(error_msg):
+            self._set_status_text(f"设置当前位置失败：{error_msg}")
+
+        self._run_async(_request, _ok, _err, thinking_text="正在保存当前位置...")
+
+    def _toggle_weather_auto_location_interactive(self):
+        self._touch()
+        prefs = self._current_memory_preferences()
+        current = bool(prefs.get("weather_auto_location"))
+        target = not current
+        if target:
+            ret = QMessageBox.question(
+                self,
+                "开启 IP 粗定位",
+                "允许 VIVY 在查询天气时用 IP 粗略判断城市吗？\n只用于天气，不做后台持续定位。",
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
+        def _request():
+            return self._request_json(
+                "/api/weather/location",
+                {"user_id": self.user_id, "auto_location": target},
+            )
+
+        def _ok(data):
+            self._set_status_text(data.get("reply") or f"IP 粗定位已{'开启' if target else '关闭'}。")
+            self._refresh_memory(silent=True)
+
+        def _err(error_msg):
+            self._set_status_text(f"切换 IP 粗定位失败：{error_msg}")
+
+        self._run_async(_request, _ok, _err, thinking_text="正在更新天气定位设置...")
+
+    def _toggle_weather_greeting_interactive(self):
+        self._touch()
+        prefs = self._current_memory_preferences()
+        current = bool(prefs.get("weather_greeting_enabled", True))
+        target = not current
+
+        def _request():
+            return self._request_json(
+                "/api/memory/update",
+                {"user_id": self.user_id, "preferences_patch": {"weather_greeting_enabled": target}},
+            )
+
+        def _ok(_data):
+            self._set_status_text(f"每日问候已{'开启' if target else '关闭'}。")
+            self._refresh_memory(silent=True)
+
+        def _err(error_msg):
+            self._set_status_text(f"切换每日问候失败：{error_msg}")
+
+        self._run_async(_request, _ok, _err, thinking_text="正在更新每日问候设置...")
+
     def _handle_messages(self, messages):
         if not messages:
             return
@@ -2575,7 +2812,94 @@ class DesktopPet(QWidget):
         t = (text or "").strip().lower()
         if not t:
             return False
+        if any(k in t for k in SONG_OFFER_REJECT_KEYWORDS):
+            return False
         return any(k in t for k in SING_TRIGGER_KEYWORDS)
+
+    def _clear_pending_song_offer(self):
+        self._pending_song_offer_until = 0.0
+
+
+    def _has_pending_song_offer(self) -> bool:
+        return time.time() < float(getattr(self, "_pending_song_offer_until", 0.0) or 0.0)
+
+
+    def _is_song_offer_acceptance(self, text: str) -> bool:
+        t = re.sub(r"\s+", "", (text or "").strip().lower())
+        if not t:
+            return False
+        if any(k in t for k in SONG_OFFER_REJECT_KEYWORDS):
+            return False
+        if self._is_sing_request(t):
+            return True
+        return any(t == k or k in t for k in SONG_OFFER_ACCEPT_KEYWORDS)
+
+
+    def _is_song_offer_rejection(self, text: str) -> bool:
+        t = re.sub(r"\s+", "", (text or "").strip().lower())
+        return bool(t) and any(k in t for k in SONG_OFFER_REJECT_KEYWORDS)
+
+
+    def _classify_emotional_support(self, text: str) -> str:
+        t = re.sub(r"\s+", "", (text or "").strip().lower())
+        if not t:
+            return "none"
+
+        crisis_keywords = (
+            "不想活", "想死", "自杀", "伤害自己", "结束生命", "活着没意思",
+            "不想继续活", "我想消失", "想从楼上跳", "割腕"
+        )
+        if any(k in t for k in crisis_keywords):
+            return "crisis"
+
+        strong_keywords = (
+            "很难过", "好难过", "真的难过", "特别难过", "想哭", "快哭了",
+            "撑不住", "心情很差", "崩溃", "受不了了", "很痛苦", "好痛苦",
+            "难受到", "很绝望", "好绝望", "很委屈", "好委屈"
+        )
+        if any(k in t for k in strong_keywords):
+            return "strong"
+
+        mild_keywords = (
+            "心情不好", "有点烦", "好烦", "烦死", "有点累", "好累",
+            "难受", "低落", "失落", "不开心", "emo", "沮丧", "郁闷",
+            "哄我", "安慰我"
+        )
+        if any(k in t for k in mild_keywords):
+            return "mild"
+        return "none"
+
+
+    def _emotional_reply(self, level: str, with_song_offer: bool = False) -> str:
+        if level == "crisis":
+            return (
+                "我听见了，这句话很重，我不会把它当成普通的难过。\n"
+                "现在先别一个人扛着，尽量去到有人在的地方，联系一个你信得过的人，或者立刻拨打当地紧急电话。\n"
+                "如果你愿意，先只回我两个字也可以：在吗。我们先把这一小会儿撑过去。"
+            )
+
+        if with_song_offer:
+            lines = [
+                "我在听。你现在不用急着振作，也不用马上把自己整理好。\n我可以先陪你说说话，也可以唱一小段给你听。你想让我怎么陪你？",
+                "听起来你今天真的撑得有点累。\n如果你不想说太多，我可以安静陪你；如果你愿意，我也可以唱给你听。",
+                "那你先慢一点。我不会急着让你好起来。\n要是你想安静一点，就告诉我“唱吧”，我唱一小段陪你。"
+            ]
+            return random.choice(lines)
+
+        if level == "strong":
+            lines = [
+                "我在。你不用急着把现在的情绪整理好，先让自己慢一点。",
+                "听起来你现在真的不太好受。没关系，先不用马上振作，我会陪着你。",
+                "今天一定有些东西压得你很累吧。你可以先难过一会儿，不需要立刻变好。"
+            ]
+            return random.choice(lines)
+
+        lines = [
+            "听起来你有点累了。今天就先别对自己太苛刻，好吗？",
+            "我在。先不用急着解释清楚，你可以慢一点说。",
+            "那就先缓一缓。不是每一次难过都需要马上被解决。"
+        ]
+        return random.choice(lines)
 
 
     def _list_song_files(self) -> list[Path]:
@@ -2589,6 +2913,7 @@ class DesktopPet(QWidget):
 
 
     def _stop_song(self):
+        self._clear_pending_song_offer()
         try:
             if self._song_delay_timer.isActive():
                 self._song_delay_timer.stop()
@@ -2596,6 +2921,13 @@ class DesktopPet(QWidget):
             pass
 
         self._pending_song_path = None
+
+        try:
+            eff = getattr(self, "_song_effect", None)
+            if eff is not None:
+                eff.stop()
+        except Exception:
+            pass
 
         try:
             import winsound
@@ -2627,9 +2959,21 @@ class DesktopPet(QWidget):
             return
 
         try:
-            import winsound
+            if os.name == "nt":
+                import winsound
 
-            winsound.PlaySound(str(song.resolve()), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                winsound.PlaySound(str(song.resolve()), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            else:
+                from PyQt6.QtMultimedia import QSoundEffect
+
+                eff = getattr(self, "_song_effect", None)
+                if eff is None:
+                    self._song_effect = QSoundEffect(self)
+                    eff = self._song_effect
+                eff.stop()
+                eff.setSource(QUrl.fromLocalFile(str(song.resolve())))
+                eff.setVolume(1.0)
+                eff.play()
             self._song_is_playing = True
             self._set_status_text(f"正在播放：{song.name}")
         except Exception as e:
@@ -2640,13 +2984,13 @@ class DesktopPet(QWidget):
 
     def _make_song_intro_text(self, request_text: str) -> str:
         t = (request_text or "").strip().lower()
-        if any(k in t for k in ("难过", "伤心", "低落", "心情不好", "安慰", "哄我")):
-            return "别急，我在。我给你唱一首歌，好吗？"
+        if "接受唱歌邀请" in t:
+            return "好。那这一次，就让我用歌声陪你一会儿。"
         if any(k in t for k in ("深夜", "晚上", "夜里", "睡不着", "失眠")):
-            return "还没睡吗。那就请让我给你唱一首歌吧。"
+            return "还没睡吗。那我轻一点唱给你听。"
         if any(k in t for k in ("唱歌", "唱首歌", "唱一首", "给我唱", "你唱")):
-            return "我在。那就让我给您唱一首歌吧。"
-        return "嗯，我给你唱一首。歌"
+            return "我在。那我唱给你听。"
+        return "嗯，我唱给你听。"
 
 
     def _speak_then_play_song(self, song: Path, intro_text: str):
@@ -2692,11 +3036,53 @@ class DesktopPet(QWidget):
             self._set_bubble_text("好，我先停下。")
             return True
 
-        if not self._is_sing_request(text):
-            return False
+        if self._has_pending_song_offer():
+            if self._is_song_offer_rejection(text):
+                self._clear_pending_song_offer()
+                reply = "好，那我先不唱。我会在这里陪你待一会儿。"
+                self._hide_options()
+                self._set_bubble_text(reply)
+                if self.auto_voice_reply:
+                    self._maybe_speak_reply(reply)
+                return True
+            if self._is_song_offer_acceptance(text):
+                self._clear_pending_song_offer()
+                self._play_random_song("接受唱歌邀请")
+                return True
 
-        self._play_random_song(text)
-        return True
+        emotion_level = self._classify_emotional_support(text)
+        if emotion_level == "crisis":
+            self._clear_pending_song_offer()
+            reply = self._emotional_reply("crisis")
+            self._hide_options()
+            self._set_bubble_text(reply)
+            if self.auto_voice_reply:
+                self._maybe_speak_reply(reply)
+            return True
+
+        if self._is_sing_request(text):
+            self._clear_pending_song_offer()
+            self._play_random_song(text)
+            return True
+
+        if emotion_level in ("mild", "strong"):
+            now = time.time()
+            with_offer = False
+            if emotion_level == "strong" and now - self._last_song_offer_ts >= SONG_OFFER_COOLDOWN_S:
+                with_offer = True
+                self._last_song_offer_ts = now
+                self._pending_song_offer_until = now + SONG_OFFER_TTL_S
+            else:
+                self._clear_pending_song_offer()
+
+            reply = self._emotional_reply(emotion_level, with_song_offer=with_offer)
+            self._hide_options()
+            self._set_bubble_text(reply)
+            if self.auto_voice_reply:
+                self._maybe_speak_reply(reply)
+            return True
+
+        return False
 
 
     def _send_from_input(self):
@@ -2773,6 +3159,14 @@ class DesktopPet(QWidget):
         if self._try_handle_local_song_request(text):
             return
 
+        if _is_local_time_query(text):
+            reply = _build_local_time_reply(text)
+            self._hide_options()
+            self._set_bubble_text(reply)
+            if self.auto_voice_reply:
+                self._maybe_speak_reply(reply)
+            return
+
         if self._busy:
             if self._chat_request_interruptible:
                 self._interrupt_active_chat_request()
@@ -2782,6 +3176,40 @@ class DesktopPet(QWidget):
 
         request_token = self._begin_chat_request()
         is_stale = lambda: not self._is_chat_request_current(request_token)
+
+        if is_weather_query(text):
+            def _request_weather():
+                if is_stale():
+                    raise RequestCancelled("cancelled")
+                return self._request_json(
+                    "/api/weather",
+                    {"user_id": self.user_id, "message": text},
+                    timeout=18,
+                )
+
+            def _ok_weather(data):
+                self._finish_chat_request(request_token)
+                reply = (data.get("reply") or "").strip()
+                if reply:
+                    self._hide_options()
+                    self._set_bubble_text(reply)
+                    if self.auto_voice_reply:
+                        self._maybe_speak_reply(reply, token=request_token)
+                self._refresh_memory(silent=True)
+
+            def _err_weather(error_msg):
+                self._finish_chat_request(request_token)
+                self._set_status_text(f"天气查询失败：{error_msg}")
+
+            self._run_async(
+                _request_weather,
+                _ok_weather,
+                _err_weather,
+                thinking_text="VIVY 正在看天气...",
+                stale_check=is_stale,
+                keep_input_enabled=True,
+            )
+            return
 
         lower = (text or "").lower()
         has_image = bool(getattr(self, "_chat_image_path", None))
@@ -2945,8 +3373,7 @@ class DesktopPet(QWidget):
         self._idle_collapsed = collapsed
         self.controls_wrap.setVisible(not collapsed)
 
-        # 底部创作领域按钮挂在 avatar_dock 下，不属于 controls_wrap；
-        # 收起时必须额外隐藏，否则会残留在人物外侧。
+        # 创作领域按钮现在挂在 controls_wrap 内，随输入区域一起收起/展开。
         if hasattr(self, "creative_actions"):
             if collapsed:
                 self.creative_actions.hide()
@@ -2980,6 +3407,89 @@ class DesktopPet(QWidget):
         self._idle_timer.setInterval(800)
         self._idle_timer.timeout.connect(self._on_idle_tick)
         self._idle_timer.start()
+
+    def _start_greeting_watch(self):
+        self._greeting_timer = QTimer(self)
+        self._greeting_timer.setInterval(60_000)
+        self._greeting_timer.timeout.connect(self._on_greeting_tick)
+        self._greeting_timer.start()
+        QTimer.singleShot(7000, lambda: self._try_weather_greeting(on_open=True))
+
+    def _current_greeting_slot(self, for_open: bool = False) -> str | None:
+        now = datetime.now().astimezone()
+        hour = now.hour
+        minute = now.minute
+        if for_open:
+            if 5 <= hour < 11:
+                return "morning"
+            if 11 <= hour < 18:
+                return "noon"
+            if 18 <= hour < 23:
+                return "evening"
+            return "late_night"
+
+        if hour == 8 and minute < 10:
+            return "morning"
+        if hour == 12 and minute < 10:
+            return "noon"
+        if hour == 20 and minute < 10:
+            return "evening"
+        if hour == 23 and 30 <= minute < 40:
+            return "late_night"
+        return None
+
+    def _on_greeting_tick(self):
+        self._try_weather_greeting(on_open=False)
+
+    def _try_weather_greeting(self, on_open: bool = False, slot: str | None = None):
+        slot = slot or self._current_greeting_slot(for_open=on_open)
+        trigger = "open" if on_open else "schedule"
+        inflight_key = f"{trigger}:{slot}"
+        if not slot or inflight_key in self._greeting_inflight_slots:
+            return
+
+        should_wait = self._busy or self._dragging or self._song_is_playing
+        should_wait = should_wait or (self.input_edit is not None and self.input_edit.hasFocus())
+        if (not on_open) and time.time() - self._last_interaction_ts < 30:
+            should_wait = True
+        if should_wait:
+            if on_open:
+                QTimer.singleShot(15_000, lambda s=slot: self._try_weather_greeting(on_open=True, slot=s))
+            return
+
+        self._greeting_inflight_slots.add(inflight_key)
+
+        def _request():
+            payload = {"user_id": self.user_id, "slot": slot, "trigger": trigger}
+            if on_open:
+                payload["open_event_id"] = self._open_event_id
+            return self._request_json(
+                "/api/weather/greeting",
+                payload,
+                timeout=18,
+            )
+
+        def _ok(data):
+            self._greeting_inflight_slots.discard(inflight_key)
+            if data.get("already_done") or data.get("disabled"):
+                if data.get("state_changed"):
+                    self._refresh_memory(silent=True)
+                return
+            reply = (data.get("reply") or "").strip()
+            if not reply:
+                return
+            self._hide_options()
+            self._set_bubble_text(reply)
+            if self.auto_voice_reply:
+                self._maybe_speak_reply(reply)
+            self._refresh_memory(silent=True)
+
+        def _err(_error_msg):
+            self._greeting_inflight_slots.discard(inflight_key)
+            if on_open:
+                QTimer.singleShot(60_000, lambda s=slot: self._try_weather_greeting(on_open=True, slot=s))
+
+        self._run_background(_request, _ok, _err)
 
     def _on_idle_tick(self):
         if self._busy or self._dragging:
@@ -3054,6 +3564,12 @@ class DesktopPet(QWidget):
         )
         act_reset = QAction("重置本机用户ID", self)
         act_set_api_key = QAction("设置 API Key", self)
+        act_set_weather_city = QAction("设置当前位置", self)
+        prefs = self._current_memory_preferences()
+        auto_loc_enabled = bool(prefs.get("weather_auto_location"))
+        greeting_enabled = bool(prefs.get("weather_greeting_enabled", True))
+        act_toggle_weather_auto = QAction(f"{'关闭' if auto_loc_enabled else '开启'} IP 粗定位", self)
+        act_toggle_weather_greeting = QAction(f"{'关闭' if greeting_enabled else '开启'} 每日问候", self)
         act_toggle_memory = QAction("显示/隐藏记忆模块", self)
         act_toggle_idle = QAction("切换待机收起", self)
         act_set_idle_timeout = QAction("设置待机时长", self)
@@ -3065,6 +3581,9 @@ class DesktopPet(QWidget):
 
         act_reset.triggered.connect(self._reset_user)
         act_set_api_key.triggered.connect(self._set_api_key_interactive)
+        act_set_weather_city.triggered.connect(self._set_weather_city_interactive)
+        act_toggle_weather_auto.triggered.connect(self._toggle_weather_auto_location_interactive)
+        act_toggle_weather_greeting.triggered.connect(self._toggle_weather_greeting_interactive)
         act_toggle_memory.triggered.connect(self._toggle_memory_panel)
         act_toggle_idle.triggered.connect(lambda: self._set_idle_collapsed(not self._idle_collapsed))
         act_set_idle_timeout.triggered.connect(self._set_idle_timeout_interactive)
@@ -3076,6 +3595,9 @@ class DesktopPet(QWidget):
 
         menu.addAction(act_reset)
         menu.addAction(act_set_api_key)
+        menu.addAction(act_set_weather_city)
+        menu.addAction(act_toggle_weather_auto)
+        menu.addAction(act_toggle_weather_greeting)
         menu.addAction(act_toggle_memory)
         menu.addAction(act_toggle_idle)
         menu.addAction(act_set_idle_timeout)
